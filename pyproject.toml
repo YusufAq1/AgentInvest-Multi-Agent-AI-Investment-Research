@@ -5,8 +5,11 @@ description = "Multi-agent equity research system producing auditable, evidence-
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=1.0,<2.0",
+    "edgartools>=5.58.0",
+    "httpx>=0.28.1",
     "pydantic>=2.0,<3.0",
     "pydantic-settings>=2.0,<3.0",
+    "yfinance>=1.7.0",
 ]
 
 [dependency-groups]
@@ -14,6 +17,8 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pytest>=8.0",
+    "respx>=0.23.1",
+    "pytest-asyncio>=1.4.0",
 ]
 
 [tool.uv]
@@ -59,5 +64,13 @@ strict_equality = true
 # module = ["backend.calc.*", "backend.evidence.*"]
 # strict = true
 
+[[tool.mypy.overrides]]
+# yfinance ships no py.typed marker / type stubs. pandas stubs exist
+# (pandas-stubs) but are only needed for the one test file that builds a
+# fake DataFrame — not worth a whole extra dependency for that.
+module = ["yfinance", "pandas"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"

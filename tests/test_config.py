@@ -18,12 +18,17 @@ def test_settings_loads_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("POSTGRES_DB", "agentinvest")
     monkeypatch.setenv("POSTGRES_HOST", "db.internal")
     monkeypatch.setenv("POSTGRES_PORT", "5433")
+    monkeypatch.setenv("EDGAR_IDENTITY", "Test Suite test@example.com")
+    monkeypatch.setenv("FRED_API_KEY", "fred-test-key")
 
     settings = Settings(_env_file=None)  # type: ignore[call-arg]
 
     assert settings.anthropic_api_key.get_secret_value() == "sk-test-123"
     assert settings.default_model == "claude-haiku-4-5-20251001"
     assert settings.postgres_dsn == "postgresql://agentinvest:s3cret@db.internal:5433/agentinvest"
+    assert settings.edgar_identity == "Test Suite test@example.com"
+    assert settings.fred_api_key.get_secret_value() == "fred-test-key"
+    assert settings.sec_requests_per_second == 10
 
 
 def test_settings_missing_required_var_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -31,6 +36,8 @@ def test_settings_missing_required_var_raises(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.delenv("POSTGRES_USER", raising=False)
     monkeypatch.delenv("POSTGRES_PASSWORD", raising=False)
     monkeypatch.delenv("POSTGRES_DB", raising=False)
+    monkeypatch.delenv("EDGAR_IDENTITY", raising=False)
+    monkeypatch.delenv("FRED_API_KEY", raising=False)
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None)  # type: ignore[call-arg]

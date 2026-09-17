@@ -9,6 +9,7 @@ dollar figure — it asks Settings for both.
 """
 
 from decimal import Decimal
+from pathlib import Path
 
 from pydantic import BaseModel, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -97,6 +98,44 @@ class Settings(BaseSettings):
     postgres_db: str
     postgres_host: str = "localhost"
     postgres_port: int = 5432
+
+    # WHY required with no default: this is sent as the User-Agent on every
+    # direct SEC request AND passed to edgartools' set_identity() — SEC asks
+    # for a real contact so it can reach a high-volume caller before
+    # blocking them. It must never be hardcoded (no real email belongs in
+    # code or .env.example) — the user supplies their own via .env.
+    edgar_identity: str
+
+    # WHY SecretStr: unlike edgar_identity (a public contact string SEC
+    # wants to see), this is a genuine credential to keep out of logs.
+    fred_api_key: SecretStr
+
+    # WHY 10, not the "8 req/s" in CLAUDE.md §15's Phase 1 bullet: SEC's
+    # currently documented ceiling is 10 req/s per user (see
+    # https://www.sec.gov/about/webmaster-frequently-asked-questions,
+    # verified 2026-09-16). edgartools' own internal default throttles to
+    # ~9/s as a safety margin under that same real ceiling — 10 here
+    # matches the verified source of truth rather than the spec's figure.
+    sec_requests_per_second: int = 10
+
+    # WHY SQLite, not the Postgres `cache` table from CLAUDE.md §14: Phase 0
+    # deliberately deferred writing to Postgres until the Evidence Store
+    # forces real persistence (Phase 2). A local SQLite file is zero new
+    # dependency (stdlib sqlite3) and sufficient for Phase 1's caching need.
+    data_cache_path: Path = Path("./data/cache.sqlite3")
+
+    # WHY a TTL at all: companyfacts/submissions/company_tickers.json have
+    # no upstream as_of parameter — SEC always returns the full current
+    # snapshot. We cache that raw snapshot keyed by fetch day and re-filter
+    # it in Python on every read; this just bounds how stale "today's
+    # snapshot" is allowed to get before re-fetching.
+    cache_snapshot_ttl_hours: int = 24
+
+    # Retry/backoff parameters (CLAUDE.md §16: exponential backoff with
+    # jitter on transient errors; no magic numbers outside this file).
+    data_retry_max_attempts: int = 5
+    data_retry_base_delay_s: float = 1.0
+    data_retry_max_delay_s: float = 30.0
 
     @property
     def postgres_dsn(self) -> str:

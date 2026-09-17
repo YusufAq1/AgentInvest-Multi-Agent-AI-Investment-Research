@@ -11,3 +11,6 @@ __pycache__/
 .ruff_cache/
 dist/
 build/
+
+# Local data-layer cache (SQLite) — generated, not committed
+/data/

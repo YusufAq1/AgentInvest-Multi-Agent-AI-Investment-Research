@@ -6,18 +6,20 @@ subjects them to adversarial critique, and produces an auditable,
 evidence-linked research report — one where every material claim traces to
 a primary source and states what would prove it wrong.
 
-**Status: Phase 0 — Foundation.** There is no research pipeline yet. This
-phase validates the environment, configuration, the Claude client wrapper,
-and cost tracking. See `docs/ARCHITECTURE.md` for what's implemented so far
-and `docs/adr/` for the reasoning behind key decisions.
+**Status: Phase 1 — Data layer.** There is no research pipeline yet, but
+`backend/data/` can retrieve real filings, fundamentals, prices, and macro
+data for any `(ticker, as_of)`, enforcing that nothing returned postdates
+`as_of`. See `docs/ARCHITECTURE.md` for what's implemented so far and
+`docs/adr/` for the reasoning behind key decisions.
 
 ## Setup
 
 ```bash
 uv sync
-cp .env.example .env   # fill in ANTHROPIC_API_KEY and Postgres credentials
+cp .env.example .env   # fill in ANTHROPIC_API_KEY, EDGAR_IDENTITY, FRED_API_KEY, Postgres creds
 docker compose up -d
-uv run python scripts/hello_world.py
+uv run python scripts/hello_world.py       # Phase 0: proves Claude cost tracking works
+uv run python scripts/data_layer_demo.py   # Phase 1: proves the data layer works
 ```
 
 ## Development
@@ -25,7 +27,7 @@ uv run python scripts/hello_world.py
 ```bash
 uv run pytest
 uv run ruff check .
-uv run mypy backend
+uv run mypy
 ```
 
 ---

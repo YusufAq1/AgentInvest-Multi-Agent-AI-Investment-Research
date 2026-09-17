@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 import anthropic
 import httpx2  # anthropic 1.6.0's HTTP transport dependency, not classic `httpx`
 import pytest
-from backend.core.config import ModelPricing, Settings
+from backend.core.config import ModelPricing
 from backend.core.llm import (
     ClaudeAuthenticationError,
     ClaudeClient,
@@ -21,6 +21,7 @@ from backend.core.llm import (
     ClaudeRateLimitError,
     compute_cost,
 )
+from tests.conftest import make_settings
 
 PRICING = ModelPricing(
     input_per_mtok=Decimal("1.00"),
@@ -65,17 +66,6 @@ def test_compute_cost_includes_cache_terms() -> None:
     assert compute_cost(usage, PRICING) == expected
 
 
-def _settings(**overrides: object) -> Settings:
-    defaults: dict[str, object] = {
-        "anthropic_api_key": "sk-test",
-        "postgres_user": "agentinvest",
-        "postgres_password": "changeme",
-        "postgres_db": "agentinvest",
-    }
-    defaults.update(overrides)
-    return Settings(_env_file=None, **defaults)  # type: ignore[arg-type,call-arg]
-
-
 def _fake_message(text: str = "hello", **usage_kwargs: int) -> SimpleNamespace:
     return SimpleNamespace(
         content=[SimpleNamespace(type="text", text=text)],
@@ -84,7 +74,7 @@ def _fake_message(text: str = "hello", **usage_kwargs: int) -> SimpleNamespace:
 
 
 def test_claude_client_call_parses_response_and_computes_cost() -> None:
-    settings = _settings()
+    settings = make_settings()
     mock_sdk_client = MagicMock()
     mock_sdk_client.messages.create.return_value = _fake_message(
         text="hi there", input_tokens=100, output_tokens=50
@@ -109,7 +99,7 @@ def test_claude_client_call_parses_response_and_computes_cost() -> None:
 
 
 def test_claude_client_call_uses_model_override() -> None:
-    settings = _settings()
+    settings = make_settings()
     mock_sdk_client = MagicMock()
     mock_sdk_client.messages.create.return_value = _fake_message()
 
@@ -121,7 +111,7 @@ def test_claude_client_call_uses_model_override() -> None:
 
 
 def test_claude_client_unpriced_model_raises_invalid_request() -> None:
-    settings = _settings()
+    settings = make_settings()
     client = ClaudeClient(settings, client=MagicMock())
 
     with pytest.raises(ClaudeInvalidRequestError):
@@ -135,7 +125,7 @@ def _api_status_error(exc_type: type[anthropic.APIStatusError], status_code: int
 
 
 def test_claude_client_maps_authentication_error() -> None:
-    settings = _settings()
+    settings = make_settings()
     mock_sdk_client = MagicMock()
     mock_sdk_client.messages.create.side_effect = _api_status_error(
         anthropic.AuthenticationError, 401
@@ -147,7 +137,7 @@ def test_claude_client_maps_authentication_error() -> None:
 
 
 def test_claude_client_maps_rate_limit_error() -> None:
-    settings = _settings()
+    settings = make_settings()
     mock_sdk_client = MagicMock()
     mock_sdk_client.messages.create.side_effect = _api_status_error(anthropic.RateLimitError, 429)
     client = ClaudeClient(settings, client=mock_sdk_client)
