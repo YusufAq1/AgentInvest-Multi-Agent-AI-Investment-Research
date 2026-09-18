@@ -13,9 +13,9 @@ from typing import Any
 
 from backend.data.cache import Cache
 from backend.data.cik import CikResolver
-from backend.data.errors import CikNotFoundError
+from backend.data.errors import CikNotFoundError, UpstreamSchemaError
 from backend.data.http import SecHttpClient
-from backend.data.models import DataUnavailable, XBRLFact
+from backend.data.models import DataUnavailable, XBRLCompanyFacts, XBRLFact
 
 _CACHE_SOURCE = "xbrl_companyfacts"
 
@@ -45,6 +45,27 @@ class XBRLClient:
         period fields look "in range." Filtering on anything but `filed`
         would leak future information into a point-in-time query — the
         exact bug class C3 exists to prevent.
+        """
+        result = await self.get_company_facts_with_raw(ticker, as_of, concepts=concepts)
+        if isinstance(result, DataUnavailable):
+            return result
+        return result.facts
+
+    async def get_company_facts_with_raw(
+        self,
+        ticker: str,
+        as_of: date,
+        *,
+        concepts: tuple[str, ...] | None = None,
+    ) -> XBRLCompanyFacts | DataUnavailable:
+        """Same as `get_company_facts`, but also returns the raw
+        companyfacts JSON payload the facts were parsed from.
+
+        WHY this exists: a caller that needs to build or verify a
+        byte-exact citation `quote` (the Financial Agent, and
+        backend/evidence/validation.py's xbrl_fact containment check) needs
+        the raw JSON, not just the parsed facts. See `find_raw_entry`
+        below for locating one fact's exact raw dict within `raw`.
         """
         try:
             cik = await self._cik.resolve(ticker, as_of)
@@ -76,7 +97,7 @@ class XBRLClient:
                 reason=f"No XBRL facts filed on/before {as_of.isoformat()}",
                 attempted_at=datetime.now(UTC),
             )
-        return facts
+        return XBRLCompanyFacts(facts=facts, raw=raw)
 
     async def _get_raw_companyfacts(self, cik: str) -> dict[str, Any] | None:
         # WHY date.today() as the cache key, not the query's real as_of:
@@ -95,6 +116,43 @@ class XBRLClient:
         raw = await self._http.get_json(url)
         await self._cache.set(source=_CACHE_SOURCE, args=args, as_of=fetch_day, payload=raw)
         return raw
+
+
+def find_raw_entry(raw: dict[str, Any], fact: XBRLFact) -> dict[str, Any]:
+    """Locates the exact raw fact dict a parsed `XBRLFact` came from.
+
+    WHY this is needed: backend/evidence/validation.py's xbrl_fact
+    containment check re-serializes the FULL raw payload with
+    `json.dumps(sort_keys=True, separators=(",", ":"))` and requires this
+    exact entry's identical serialization to appear as a substring. The
+    Financial Agent must build its citation `quote` from THIS dict, not a
+    reconstructed approximation, or the two serializations won't match
+    byte-for-byte.
+
+    Raises `UpstreamSchemaError` if no matching entry is found — this
+    would mean the fact was parsed from a payload that no longer matches
+    `raw` (a caller bug, not a data-availability problem).
+    """
+    try:
+        entries: list[dict[str, Any]] = raw["facts"][fact.taxonomy][fact.concept]["units"][
+            fact.unit
+        ]
+    except KeyError as exc:
+        raise UpstreamSchemaError(
+            f"raw payload has no {fact.taxonomy}/{fact.concept}/{fact.unit} entries"
+        ) from exc
+
+    expected_start = fact.period_start.isoformat() if fact.period_start else None
+    for entry in entries:
+        if (
+            entry["accn"] == fact.accession_number
+            and entry["end"] == fact.period_end.isoformat()
+            and entry.get("start") == expected_start
+        ):
+            return entry
+    raise UpstreamSchemaError(
+        f"could not relocate raw entry for {fact.concept} accession {fact.accession_number}"
+    )
 
 
 def _parse_facts(

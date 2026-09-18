@@ -6,11 +6,12 @@ subjects them to adversarial critique, and produces an auditable,
 evidence-linked research report — one where every material claim traces to
 a primary source and states what would prove it wrong.
 
-**Status: Phase 1 — Data layer.** There is no research pipeline yet, but
-`backend/data/` can retrieve real filings, fundamentals, prices, and macro
-data for any `(ticker, as_of)`, enforcing that nothing returned postdates
-`as_of`. See `docs/ARCHITECTURE.md` for what's implemented so far and
-`docs/adr/` for the reasoning behind key decisions.
+**Status: Phase 2 — Evidence Store + Financial Agent.** The first agent is
+live: given a `(ticker, as_of)`, the Financial Agent reads XBRL, computes
+ratios in pure Python, and asks Claude which resulting facts are
+claim-worthy — every claim citing evidence Python built and verified, never
+free text Claude invented. See `docs/ARCHITECTURE.md` for what's
+implemented so far and `docs/adr/` for the reasoning behind key decisions.
 
 ## Setup
 
@@ -18,8 +19,9 @@ data for any `(ticker, as_of)`, enforcing that nothing returned postdates
 uv sync
 cp .env.example .env   # fill in ANTHROPIC_API_KEY, EDGAR_IDENTITY, FRED_API_KEY, Postgres creds
 docker compose up -d
-uv run python scripts/hello_world.py       # Phase 0: proves Claude cost tracking works
-uv run python scripts/data_layer_demo.py   # Phase 1: proves the data layer works
+uv run python scripts/hello_world.py           # Phase 0: proves Claude cost tracking works
+uv run python scripts/data_layer_demo.py       # Phase 1: proves the data layer works
+uv run python scripts/financial_agent_demo.py  # Phase 2: proves the Financial Agent works
 ```
 
 ## Development

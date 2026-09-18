@@ -137,6 +137,21 @@ class Settings(BaseSettings):
     data_retry_base_delay_s: float = 1.0
     data_retry_max_delay_s: float = 30.0
 
+    # WHY None, not a hardcoded model string: §5 says model choice is set
+    # per agent in config, never hardcoded at a call site. None means "fall
+    # back to default_model" (Haiku) — an override only needs to be set
+    # here if/when an eval shows the Financial Agent needs escalating.
+    financial_agent_model: str | None = None
+    # WHY 4096, not 1024: a real run (multiple claims, each with a
+    # statement plus an evidence_ids array) legitimately needs more than
+    # 1024 output tokens — confirmed by a live run hitting
+    # stop_reason="max_tokens" at the smaller value. This is a genuine
+    # output-size need, not the earlier bug where the INPUT prompt was
+    # accidentally bloated with unused historical evidence (see
+    # backend/agents/financial.py's lazy evidence construction and
+    # docs/INTERVIEW_NOTES.md).
+    financial_agent_max_tokens: int = 4096
+
     @property
     def postgres_dsn(self) -> str:
         """Single source of truth for the connection string.

@@ -7,7 +7,7 @@ are worth the small overhead dataclasses don't give us for free.
 """
 
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -60,6 +60,22 @@ class XBRLFact(BaseModel):
     form: str
     filed: date
     accession_number: str
+
+
+class XBRLCompanyFacts(BaseModel):
+    """Parsed facts plus the raw companyfacts payload they came from.
+
+    WHY bundled together: callers that need to build or verify a
+    byte-exact citation `quote` (the Financial Agent, and
+    backend/evidence/validation.py's xbrl_fact containment check) need
+    BOTH the parsed, typed facts and the raw JSON — returning them
+    separately would mean fetching companyfacts twice (a second local
+    cache read is cheap, but re-deriving the CIK-resolution/DataUnavailable
+    handling a second time would duplicate xbrl.py's own logic elsewhere).
+    """
+
+    facts: list[XBRLFact]
+    raw: dict[str, Any]
 
 
 class PriceBar(BaseModel):

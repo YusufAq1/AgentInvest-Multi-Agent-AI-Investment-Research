@@ -162,7 +162,10 @@ class EdgarClient:
                 f"{type(real_filing).__name__})"
             )
         try:
-            obj = real_filing.obj()
+            # WHY the ignore: edgartools' Filing.obj() has no return type
+            # annotation (confirmed via inspect.signature on the installed
+            # package) — a gap in their type hints, not ours to fix.
+            obj = real_filing.obj()  # type: ignore[no-untyped-call]
             result = obj[section]
         except (KeyError, TypeError) as exc:
             raise PermanentDataError(f"Section {section!r} not available") from exc

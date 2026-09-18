@@ -23,7 +23,7 @@ LLM call:
    rates, DCF, confidence scores — is a pure, unit-tested Python function.
    The LLM interprets results; it never computes them.
 
-## Current status: Phase 1 — Data layer
+## Current status: Phase 2 — Evidence Store + Financial Agent
 
 ### Phase 0 — Foundation
 - `backend/core/config.py` — process settings (Anthropic key, default
@@ -94,7 +94,50 @@ SEC could momentarily exceed the 10 req/s ceiling. A cross-process shared
 limiter isn't justified at Phase 1's scale (one research run, one ticker at
 a time) — documented here as a conscious simplification, not an oversight.
 
-Not yet implemented: the Evidence Store, any research agent, retrieval,
+### Phase 2 — Evidence Store + Financial Agent (`backend/evidence/`, `backend/calc/`, `backend/agents/`)
+
+`backend/evidence/` is the anti-hallucination mechanism CLAUDE.md §6
+describes, implemented in code:
+
+- `models.py` — `Evidence`, `Claim` (with a Pydantic validator enforcing
+  "claim_type='evidence' requires ≥1 evidence_id"), `ClaimBatch` (the
+  Financial Agent's structured-output shape), `DroppedClaim`.
+- `store.py` — `EvidenceStore`, in-memory and per-run. Enforces "every
+  evidence_id must resolve to a row that exists" (`resolve`/`add_claim`)
+  and a look-ahead guard (`add_evidence` rejects `published_at > as_of`).
+  Deliberately not Postgres-backed yet — see ADR-0012.
+- `validation.py` — citation-validity checks, two paths by `source_type`:
+  substring containment for prose/XBRL-JSON, recompute-and-compare against
+  resolved input evidence for `computed` values (a derived ratio has no
+  upstream document to contain it in). This is the direct, tested mechanism
+  behind this phase's exit criterion ("CI fails if a fabricated citation is
+  introduced deliberately") — see ADR-0012 for the full design and the
+  documented batch-vs-per-claim retry tradeoff.
+
+`backend/calc/ratios.py` — four pure ratio functions (`gross_margin`,
+`net_margin`, `current_ratio`, `yoy_revenue_growth`), each returning a
+`RatioResult` carrying its formula and inputs so both the Financial Agent
+(building `computed` Evidence) and `validation.py` (recomputing to verify)
+share one `RATIO_FUNCS` dispatch table. This package and `backend/evidence/`
+are the first to run under `mypy --strict` (CLAUDE.md §16) — the override
+that was a commented-out placeholder since Phase 0 is now active.
+
+**The Financial Agent calls Claude only to phrase and classify, never to
+compute.** Python creates every `Evidence` row deterministically from XBRL
+data — both raw facts (`xbrl_fact`) and computed ratios (`computed`) —
+*before* Claude is ever called. A forced-tool-use Haiku call
+(`ClaudeClient.call_structured`, extending the Phase 0 `ClaudeClient`)
+receives that evidence set and can only cite `evidence_id`s from it; a
+hallucinated or out-of-set id fails `EvidenceStore.resolve`, triggering the
+same one-retry-then-drop mechanism as a schema-level Pydantic failure. This
+is what makes the claims impossible to fabricate rather than merely
+unlikely to.
+
+`ClaudeClient.call_structured` is generic over any Pydantic model (not
+hardcoded to `Claim`) — every later agent (Filings, News, Bull, Bear,
+Critic) reuses it unchanged for its own structured output.
+
+Not yet implemented: retrieval/RAG, the remaining specialist agents,
 valuation, the debate layer, the API, or the frontend. This file will grow
 with each phase — see `CLAUDE.md` §15 for the phase plan and §11 for the
 documentation standard this file follows.

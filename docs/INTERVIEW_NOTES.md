@@ -90,3 +90,73 @@ fallback against a source I can't verify is durable would just move the
 reliability problem, not solve it. Phase 1 ships yfinance-only, with
 `DataUnavailable` on failure — an explicit, documented gap (ADR-0011), not
 a silently downgraded feature.
+
+## How do you prevent the LLM from fabricating a citation?
+
+Two independent layers, not one. First, Claude never creates evidence — the
+Financial Agent builds every `Evidence` row itself, deterministically, from
+XBRL data, before Claude is ever called. Claude only *cites* `evidence_id`s
+from the set it's shown; a hallucinated or out-of-set id fails
+`EvidenceStore.resolve` (not a Pydantic concern — a bare `Claim` has no
+store to check against), which triggers the same one-retry-then-drop
+mechanism as a schema-level validation failure, and drops the whole batch
+if the retry also fails. Second, independent of any given run, a
+citation-validity sweep (`backend/evidence/validation.py`) re-verifies
+every stored quote against its real source — substring containment for
+prose and for XBRL JSON, recompute-and-compare against resolved input
+evidence for derived ratios. That second layer is what catches a bug in
+the agent's own quote-construction code, not just bad LLM behavior — the
+test suite proves it directly by constructing a deliberately fabricated
+quote and asserting it's rejected.
+
+## Why does the Financial Agent call Claude at all if Python computes everything?
+
+Because "which of these true, computed facts are worth stating, in what
+words, and how material is each" is a judgment call, not arithmetic —
+exactly CLAUDE.md §7's dividing line. Python owns every number; Claude
+only decides what to say about numbers Python already computed and
+verified, via a forced tool call it cannot deviate from into free text.
+This also means the cheapest possible agent is the one that first exercises
+the full structured-output + retry + drop machinery (`call_structured` in
+`backend/core/llm.py`), so every later, more complex agent (Filings, Bull,
+Bear, Critic) reuses it unchanged instead of it being designed in the
+abstract for a hypothetical future need.
+
+## Why is the Evidence Store in-memory in Phase 2?
+
+Same reasoning as Phase 1's SQLite-not-Postgres cache: nothing in Phase 2
+needs a claim or evidence row to outlive one process, so building
+Postgres persistence now would be scope the exit criterion doesn't ask
+for. It gets built for real (CLAUDE.md §14's `evidence`/`claims`/
+`claim_evidence` tables) once a later phase actually needs a run's claims
+to be queryable after the process exits — see ADR-0012.
+
+## What actually broke the first time you ran the Financial Agent for real?
+
+The unit tests all passed, but the first live run against AAPL produced a
+78,267-input-token prompt — about 8 cents for one call, and Claude
+truncated its response before finishing. The cause: `_build_fact_evidence`
+turned *every* historical XBRL fact matching the concept aliases into
+Evidence, and SEC companyfacts includes a concept's entire filing history —
+Apple has been tagging `Revenues`/`CostOfRevenue`/etc. since ~2009, and
+every subsequent 10-Q/10-K re-reports prior periods as comparatives, so one
+concept easily has 50+ entries. All of that was getting formatted into the
+prompt, even though only the current and one prior period are ever
+actually used.
+
+The fix wasn't a bigger `max_tokens` — that treats the symptom. It was
+making evidence construction lazy: `run()` now only calls
+`ensure_fact_evidence(fact)` for the specific facts the ratio-selection
+logic (`_select_anchor`/`_select_matching`/`_select_prior_year`) actually
+picked, closing over a memoizing dict instead of eagerly building Evidence
+for the whole candidate pool up front. A run now creates on the order of
+10 evidence rows (the handful of facts used, plus their computed ratios)
+regardless of how many years of history a filer has. There's a regression
+test for this specifically (`test_run_does_not_turn_entire_history_into_evidence`)
+that constructs 15 years of fake revenue history and asserts the evidence
+count stays bounded — this is exactly the kind of bug unit tests with
+small, hand-built fixtures don't catch on their own, because the fixtures
+never had enough history to reproduce the blowup. It's why the phase
+scripts (`hello_world.py`, `data_layer_demo.py`, `financial_agent_demo.py`)
+exist as a real end-to-end check alongside the test suite, not a
+redundant formality.

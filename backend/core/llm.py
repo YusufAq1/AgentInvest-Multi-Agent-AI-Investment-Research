@@ -15,15 +15,18 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from decimal import Decimal
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 import anthropic
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from backend.core.config import ModelPricing, Settings
 
 logger = logging.getLogger("agentinvest.llm")
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 class AgentInvestError(Exception):
@@ -61,6 +64,32 @@ class ClaudeServerError(ClaudeAPIError):
 
 class ClaudeConnectionError(ClaudeAPIError):
     """The request never reached Anthropic (network failure, timeout)."""
+
+
+class ClaudeRefusalError(ClaudeAPIError):
+    """Claude declined to answer (`stop_reason == "refusal"`). Not a
+    validation problem — retrying with the same prompt won't help, so
+    `call_structured` never retries this."""
+
+
+class ClaudeTruncatedToolCallError(ClaudeAPIError):
+    """The tool call's JSON input may have been cut off
+    (`stop_reason == "max_tokens"`). Not retried: a truncated payload needs
+    a larger `max_tokens`, not feedback — retrying with the same limit
+    would just truncate again."""
+
+
+class StructuredOutputError(ClaudeAPIError):
+    """`call_structured` validated the tool output twice (initial call plus
+    one retry) and both attempts failed. Carries the failure detail so the
+    caller can record what was dropped (CLAUDE.md §6 rule 4: "record the
+    drop," never a silent discard).
+    """
+
+    def __init__(self, message: str, *, last_error: Exception, raw_input: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.last_error = last_error
+        self.raw_input = raw_input
 
 
 class UsageLike(Protocol):
@@ -151,19 +180,172 @@ class ClaudeClient:
         it's calling for. That discipline is what makes the per-agent cost
         breakdown in later phases possible without retrofitting anything.
 
-        `tools`/`tool_choice` are accepted now, unused by Phase 0, purely so
-        a Phase 2+ agent needing forced tool use / native structured output
-        (CLAUDE.md §16) doesn't require a signature change here.
+        `tools`/`tool_choice` are accepted for a plain-text call that
+        happens to offer tools without forcing one. For forced tool use
+        with Pydantic validation and a retry-on-failure loop (CLAUDE.md
+        §16), use `call_structured` instead.
+        """
+        _, result = self._call_raw(
+            agent=agent,
+            messages=messages,
+            system=system,
+            model=model,
+            max_tokens=max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        return result
 
-        Retries are deliberately not hand-rolled in Phase 0: the Anthropic
-        SDK already retries connection errors, 408/409/429, and 5xx with
-        exponential backoff by default (`max_retries=2`). CLAUDE.md §16
-        wants a custom transient/permanent distinction at the application
-        level, but that judgment call (skip a claim vs. retry a whole
-        research task) belongs with the first real agent loop that needs to
-        make it, not a single synchronous demo call.
-        # TODO(phase2+): add application-level retry/backoff here once a
-        # real agent loop exists to decide what "give up" means.
+    def call_structured(
+        self,
+        *,
+        agent: str,
+        model_cls: type[ModelT],
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        model: str | None = None,
+        max_tokens: int = 1024,
+        tool_name: str,
+        tool_description: str,
+        extra_validation: Callable[[ModelT], None] | None = None,
+    ) -> ModelT:
+        """Force a tool call, validate its input as `model_cls`, and retry
+        once with the validation error fed back if it fails — the exact
+        pattern CLAUDE.md §16 requires: "use native structured outputs or
+        forced tool use, then Pydantic validation, then a single retry that
+        feeds the validation error back. Never rely on 'reply only in
+        JSON' prompting."
+
+        `extra_validation`, if given, runs after Pydantic validation
+        succeeds and should raise `ValueError` (or a subclass) to signal a
+        failure that should trigger the same retry-with-feedback flow —
+        e.g. an agent closing over `EvidenceStore.resolve` to reject a
+        well-formed `Claim` that cites an evidence_id outside the set it
+        was shown. Anything else `extra_validation` raises propagates
+        uncaught, same as any other unexpected exception.
+
+        Raises `StructuredOutputError` (carrying `.last_error`/`.raw_input`
+        for the caller to record a drop) if both the initial call and the
+        one retry fail. Raises `ClaudeRefusalError`/
+        `ClaudeTruncatedToolCallError` immediately, with no retry, if
+        Claude refused or its tool call may have been truncated — neither
+        is a validation problem feedback can fix.
+        """
+        tool: dict[str, Any] = {
+            "name": tool_name,
+            "description": tool_description,
+            "input_schema": model_cls.model_json_schema(),
+        }
+        tool_choice: dict[str, Any] = {"type": "tool", "name": tool_name}
+
+        response, _ = self._call_raw(
+            agent=agent,
+            messages=messages,
+            system=system,
+            model=model,
+            max_tokens=max_tokens,
+            tools=[tool],
+            tool_choice=tool_choice,
+        )
+        parsed, error, raw_input, tool_use = self._parse_tool_output(
+            response, model_cls, extra_validation
+        )
+        if parsed is not None:
+            return parsed
+
+        # WHY replaying `response.content` unmodified: verified against the
+        # actually-installed SDK that its request-transform layer
+        # (anthropic/_utils/_transform.py::_transform_recursive) detects any
+        # nested pydantic.BaseModel and calls model_dump(mode="json", ...)
+        # on it automatically — no manual serialization needed here.
+        retry_messages: list[dict[str, Any]] = [
+            *messages,
+            {"role": "assistant", "content": response.content},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use.id,
+                        "is_error": True,
+                        "content": str(error),
+                    }
+                ],
+            },
+        ]
+        response2, _ = self._call_raw(
+            agent=agent,
+            messages=retry_messages,
+            system=system,
+            model=model,
+            max_tokens=max_tokens,
+            tools=[tool],
+            tool_choice=tool_choice,
+        )
+        parsed2, error2, raw_input2, _ = self._parse_tool_output(
+            response2, model_cls, extra_validation
+        )
+        if parsed2 is not None:
+            return parsed2
+
+        assert error2 is not None  # guaranteed: _parse_tool_output only returns
+        # (None, ...) via its except clause, which always sets a real error.
+        raise StructuredOutputError(
+            f"{tool_name!r} failed validation twice for agent={agent!r}: {error2}",
+            last_error=error2,
+            raw_input=raw_input2,
+        )
+
+    def _parse_tool_output(
+        self,
+        response: Any,
+        model_cls: type[ModelT],
+        extra_validation: Callable[[ModelT], None] | None,
+    ) -> tuple[ModelT | None, Exception | None, dict[str, Any], Any]:
+        """Returns `(parsed, None, raw_input, tool_use)` on success, or
+        `(None, error, raw_input, tool_use)` on a validation failure the
+        caller should retry. Raises directly (no retry) for a refusal or a
+        possibly-truncated tool call — see call_structured's docstring."""
+        if response.stop_reason == "refusal":
+            raise ClaudeRefusalError(f"Claude refused to produce structured output for {model_cls}")
+        if response.stop_reason == "max_tokens":
+            raise ClaudeTruncatedToolCallError(
+                f"Tool call input for {model_cls} may have been truncated "
+                "(stop_reason=max_tokens) — increase max_tokens"
+            )
+        tool_use = next(block for block in response.content if block.type == "tool_use")
+        try:
+            parsed = model_cls.model_validate(tool_use.input)
+            if extra_validation is not None:
+                extra_validation(parsed)
+        except (ValidationError, ValueError) as exc:
+            return None, exc, tool_use.input, tool_use
+        return parsed, None, tool_use.input, tool_use
+
+    def _call_raw(
+        self,
+        *,
+        agent: str,
+        messages: list[dict[str, Any]],
+        system: str | None,
+        model: str | None,
+        max_tokens: int,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: dict[str, Any] | None,
+    ) -> tuple[Any, LLMCallResult]:
+        """The actual SDK call: exception mapping, cost computation, and
+        structured logging — shared by `call()` and `call_structured()` so
+        neither reimplements cost tracking. Returns both the raw SDK
+        response (needed by `call_structured` to extract a tool_use block
+        and to replay `response.content` in a retry) and the existing,
+        unchanged `LLMCallResult`.
+
+        Retries are deliberately not hand-rolled here: the Anthropic SDK
+        already retries connection errors, 408/409/429, and 5xx with
+        exponential backoff by default (`max_retries=2`). CLAUDE.md §16's
+        transient/permanent distinction at the application level is a
+        judgment call (skip a claim vs. retry a whole research task) that
+        belongs with whichever agent loop needs to make it.
         """
         resolved_model = model or self._settings.default_model
         pricing = self._settings.model_pricing.get(resolved_model)
@@ -198,8 +380,8 @@ class ClaudeClient:
             raise ClaudeConnectionError(str(exc)) from exc
         except anthropic.APIStatusError as exc:
             # Catch-all for any other status Anthropic can return (403,
-            # 404, 409, 422, 5xx) that Phase 0 doesn't need to distinguish
-            # further yet.
+            # 404, 409, 422, 5xx) that this project doesn't need to
+            # distinguish further yet.
             raise ClaudeServerError(str(exc)) from exc
         latency_ms = (time.monotonic() - start) * 1000
 
@@ -234,4 +416,4 @@ class ClaudeClient:
                 "cost_usd": str(result.cost_usd),
             },
         )
-        return result
+        return response, result
