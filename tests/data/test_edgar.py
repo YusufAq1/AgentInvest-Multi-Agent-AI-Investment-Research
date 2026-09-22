@@ -119,3 +119,103 @@ async def test_get_filing_section_returns_section_text(mock_find: MagicMock) -> 
     result = await client.get_filing_section(filing, "Item 1A", as_of=date(2024, 6, 30))
 
     assert result == "Risk factors text."
+
+
+async def test_get_filing_document_rejects_stale_filing_against_new_as_of() -> None:
+    client = EdgarClient(make_settings())
+    filing = Filing(
+        accession_number="ACC-1", form="10-K", filing_date=date(2024, 8, 1), cik="0000320193"
+    )
+
+    result = await client.get_filing_document(filing, as_of=date(2024, 6, 30))
+
+    assert isinstance(result, DataUnavailable)
+    assert result.source == "edgar"
+
+
+@patch("backend.data.edgar.edgar_find")
+async def test_get_filing_document_returns_sections(mock_find: MagicMock) -> None:
+    fake_section = SimpleNamespace(
+        title="Item 1A - Risk Factors",
+        item="1A",
+        part=None,
+        confidence=0.95,
+        detection_method="toc",
+        text=lambda: "Risk factors section text.",
+    )
+    fake_document = SimpleNamespace(
+        sections=SimpleNamespace(items=lambda: [("item_1a", fake_section)]),
+    )
+    fake_obj = SimpleNamespace(document=fake_document, period_of_report="2023-12-31")
+
+    real_filing = EdgarFiling(
+        cik=320193,
+        company="Apple Inc.",
+        form="10-K",
+        filing_date="2024-02-01",
+        accession_no="ACC-1",
+    )
+    real_filing.obj = lambda: fake_obj  # type: ignore[method-assign]
+    mock_find.return_value = real_filing
+
+    client = EdgarClient(make_settings())
+    filing = Filing(
+        accession_number="ACC-1", form="10-K", filing_date=date(2024, 2, 1), cik="0000320193"
+    )
+    result = await client.get_filing_document(filing, as_of=date(2024, 6, 30))
+
+    assert not isinstance(result, DataUnavailable)
+    assert len(result.sections) == 1
+    assert result.sections[0].item == "1A"
+    assert result.sections[0].detection_method == "toc"
+    assert result.sections[0].text == "Risk factors section text."
+    assert result.period_of_report == date(2023, 12, 31)
+
+
+@patch("backend.data.edgar.edgar_find")
+async def test_get_filing_document_handles_unparseable_period_of_report(
+    mock_find: MagicMock,
+) -> None:
+    fake_document = SimpleNamespace(sections=SimpleNamespace(items=lambda: []))
+    fake_obj = SimpleNamespace(document=fake_document, period_of_report="not-a-date")
+    real_filing = EdgarFiling(
+        cik=320193,
+        company="Apple Inc.",
+        form="10-K",
+        filing_date="2024-02-01",
+        accession_no="ACC-1",
+    )
+    real_filing.obj = lambda: fake_obj  # type: ignore[method-assign]
+    mock_find.return_value = real_filing
+
+    client = EdgarClient(make_settings())
+    filing = Filing(
+        accession_number="ACC-1", form="10-K", filing_date=date(2024, 2, 1), cik="0000320193"
+    )
+    result = await client.get_filing_document(filing, as_of=date(2024, 6, 30))
+
+    assert not isinstance(result, DataUnavailable)
+    assert result.period_of_report is None
+
+
+@patch("backend.data.edgar.edgar_find")
+async def test_get_filing_document_unsupported_form_is_data_unavailable(
+    mock_find: MagicMock,
+) -> None:
+    real_filing = EdgarFiling(
+        cik=320193,
+        company="Apple Inc.",
+        form="10-K",
+        filing_date="2024-02-01",
+        accession_no="ACC-1",
+    )
+    real_filing.obj = lambda: None  # type: ignore[method-assign]
+    mock_find.return_value = real_filing
+
+    client = EdgarClient(make_settings())
+    filing = Filing(
+        accession_number="ACC-1", form="10-K", filing_date=date(2024, 2, 1), cik="0000320193"
+    )
+    result = await client.get_filing_document(filing, as_of=date(2024, 6, 30))
+
+    assert isinstance(result, DataUnavailable)

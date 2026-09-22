@@ -7,6 +7,35 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # WHY a real Postgres+pgvector service container, not a mock: Phase 3's
+    # indexing/retrieval logic genuinely depends on real HNSW and tsvector
+    # behavior, which nothing short of a real database can meaningfully
+    # verify (see docs/adr/0013). This is the same pgvector/pgvector:pg16
+    # image docker-compose.yml uses locally — ephemeral per CI run, never
+    # the live Supabase project (no secrets/shared state in CI).
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: agentinvest
+          POSTGRES_PASSWORD: changeme
+          POSTGRES_DB: agentinvest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentinvest -d agentinvest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ANTHROPIC_API_KEY: sk-test
+      POSTGRES_USER: agentinvest
+      POSTGRES_PASSWORD: changeme
+      POSTGRES_DB: agentinvest
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: 5432
+      EDGAR_IDENTITY: "CI Test Suite ci@example.com"
+      FRED_API_KEY: ci-test-key
     steps:
       - uses: actions/checkout@v4
 
@@ -17,6 +46,10 @@ jobs:
       # Fails the build if pyproject.toml and uv.lock have drifted, so the
       # lockfile everyone commits is actually what CI runs.
       - run: uv sync --locked
+
+      # Runs before ruff/mypy/pytest so a broken migration fails loudly and
+      # early, not buried inside a later pytest failure.
+      - run: uv run alembic upgrade head
 
       - run: uv run ruff check .
       - run: uv run ruff format --check .

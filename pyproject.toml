@@ -5,10 +5,14 @@ description = "Multi-agent equity research system producing auditable, evidence-
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=1.0,<2.0",
+    "asyncpg>=0.29",
     "edgartools>=5.58.0",
     "httpx>=0.28.1",
+    "pgvector>=0.3",
     "pydantic>=2.0,<3.0",
     "pydantic-settings>=2.0,<3.0",
+    "sentence-transformers>=3.0",
+    "sqlalchemy[asyncio]>=2.0,<3.0",
     "yfinance>=1.7.0",
 ]
 
@@ -19,6 +23,7 @@ dev = [
     "pytest>=8.0",
     "respx>=0.23.1",
     "pytest-asyncio>=1.4.0",
+    "alembic>=1.13",
 ]
 
 [tool.uv]
@@ -34,7 +39,7 @@ packages = ["backend"]
 [tool.ruff]
 target-version = "py312"
 line-length = 100
-src = ["backend", "tests", "scripts"]
+src = ["backend", "tests", "scripts", "evaluation"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "N"]
@@ -44,7 +49,7 @@ quote-style = "double"
 
 [tool.mypy]
 python_version = "3.12"
-files = ["backend", "tests", "scripts"]
+files = ["backend", "tests", "scripts", "evaluation"]
 warn_return_any = true
 warn_unused_configs = true
 warn_unused_ignores = true
@@ -57,8 +62,13 @@ strict_equality = true
 
 # WHY: CLAUDE.md §16 requires `mypy --strict` on backend/calc/ and
 # backend/evidence/ specifically — both now exist as of Phase 2.
+# backend.rag.chunking joins them in Phase 3: it's pure offset/token logic
+# with no I/O, the same kind of code strict mode was adopted for.
+# backend.db.* and backend.rag.embeddings/indexing/retrieval do NOT join —
+# ORM declarative typing and third-party model/session types fight strict
+# mode for little benefit (see backend/db/models.py's module docstring).
 [[tool.mypy.overrides]]
-module = ["backend.calc.*", "backend.evidence.*"]
+module = ["backend.calc.*", "backend.evidence.*", "backend.rag.chunking"]
 strict = true
 
 [[tool.mypy.overrides]]

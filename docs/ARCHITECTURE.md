@@ -23,7 +23,7 @@ LLM call:
    rates, DCF, confidence scores — is a pure, unit-tested Python function.
    The LLM interprets results; it never computes them.
 
-## Current status: Phase 2 — Evidence Store + Financial Agent
+## Current status: Phase 3 — RAG over filings
 
 ### Phase 0 — Foundation
 - `backend/core/config.py` — process settings (Anthropic key, default
@@ -137,7 +137,122 @@ unlikely to.
 hardcoded to `Claim`) — every later agent (Filings, News, Bull, Bear,
 Critic) reuses it unchanged for its own structured output.
 
-Not yet implemented: retrieval/RAG, the remaining specialist agents,
+### Phase 3 — RAG over filings (`backend/db/`, `backend/rag/`)
+
+This is the first phase that writes to a real Postgres database. Phases
+0-2 deliberately deferred it (SQLite cache, in-memory Evidence Store); RAG
+retrieval is the first thing that genuinely needs cross-run, queryable,
+pgvector-indexed storage. See ADR-0013 for why the primary connection
+target is a Supabase project rather than the `docker-compose.yml` Postgres
+CLAUDE.md originally specified (Docker wasn't available in this dev
+environment) — `docker-compose.yml` is unchanged and is exactly what CI's
+test database still uses.
+
+**`backend/db/`** — SQLAlchemy async engine/session (`session.py`) and ORM
+models (`models.py`) for CLAUDE.md §14's `documents`/`document_chunks`
+tables, migrated via Alembic (`migrations/`, run through an async
+`connection.run_sync(...)` pattern rather than a second sync DB driver —
+this project's only Postgres driver anywhere is asyncpg). `document_chunks`
+carries pgvector's `embedding vector(1024)` (an HNSW index,
+`vector_cosine_ops`, `m=16, ef_construction=64`, built on the empty table
+in the initial migration per §14) and a *generated* `tsvector` column
+(`to_tsvector('english', text)`, always in sync with `text`, no
+application-level maintenance) plus a GIN index on it. `char_start`/
+`char_end` are added beyond §14's literal metadata list — see ADR-0015 for
+why they're necessary for citation-quote verification, the same principle
+already applied to `xbrl_fact` evidence.
+
+**`backend/rag/chunking.py`** (pure, no I/O — joins `backend.calc.*`/
+`backend.evidence.*` under `mypy --strict`) — section-aware chunking via
+`edgartools`' detected sections. `build_full_text()` reconstructs a
+filing's storable text by concatenating each section's own extracted
+text, and offsets are computed *while building that text*, not trusted
+from edgartools' `start_offset`/`end_offset` or searched for inside a
+separately-fetched document text — real-data testing against a live AAPL
+10-K showed both of those were unreliable (every section reported
+`start_offset=0`, and a substring-search fallback failed for every
+section too, since `Section.text()` and `Document.text()` come from
+different, non-byte-comparable extraction paths inside edgartools). See
+ADR-0015's revision history for the full falsification-and-pivot story —
+a design that passed its own hand-crafted unit tests but produced zero
+usable chunks the first time it met a real filing, caught only because
+this project verifies against real data before calling a phase done.
+`confidence`/`detection_method` are still used, to skip sections
+edgartools itself flags as unreliably detected. Long sections are
+sub-chunked by token count (BGE-M3's own tokenizer, via
+`backend/rag/embeddings.py`'s `get_tokenizer()` — no second dependency)
+with overlap, using the tokenizer's `offset_mapping` to recover exact char
+spans with no substring search needed. Re-verified end-to-end against the
+same real filing after the fix: 110 chunks, zero offset mismatches.
+
+**`backend/rag/embeddings.py`** — local `BAAI/bge-m3` dense embeddings via
+`sentence-transformers`, CPU-only (free, per C1). A lazy, double-checked-
+locking singleton — importing this module (which chunking.py does,
+transitively, for its tokenizer) never forces the ~2GB model download;
+only an actual `embed_texts`/`get_tokenizer` call does, and both are
+mockable in tests without ever loading a real model.
+
+**`backend/rag/indexing.py`** — fetch (a new, additive
+`EdgarClient.get_filing_document` method returning a filing's full text
+plus section metadata) → chunk → embed (one batched call per filing) →
+write. Idempotent: a re-run with an unchanged chunk count for an accession
+skips embedding+writing entirely; a changed chunk count (e.g. after a
+chunking-logic change) deletes and rebuilds that accession's chunks in one
+transaction rather than patching a stale partial set.
+
+**`backend/rag/retrieval.py`** — hybrid search: a dense leg (pgvector
+`vector_cosine_ops` HNSW ordering) and a full-text leg (`tsvector @@
+plainto_tsquery`, ranked by `ts_rank`), each independently filtered to
+`ticker` and `filing_date <= as_of` (retrieval's own as_of enforcement —
+`tests/rag/test_retrieval.py` includes a leakage test proving a
+post-as_of chunk never surfaces regardless of similarity score, this
+phase's version of CLAUDE.md §12's most important test). The two ranked
+id lists are fused in Python via Reciprocal Rank Fusion
+(`fuse_rankings()`, unit-tested against hand-computed orderings with no
+database at all) rather than a single blended-score SQL query — see
+ADR-0014 for why RRF specifically, and why cosine distance and `ts_rank`
+can't be usefully blended directly.
+
+**Testing**: `tests/rag/conftest.py` adds this project's first real-
+database test fixtures (`db_engine`, `db_session`, `session_factory`),
+using SQLAlchemy's documented "join a session into an external
+transaction" pattern (`join_transaction_mode="create_savepoint"`) so every
+test starts from a clean slate via rollback, without truncating tables.
+CI (`.github/workflows/ci.yml`) now runs a `pgvector/pgvector:pg16` service
+container so indexing/retrieval tests exercise real HNSW/`tsvector`
+behavior — a mock can't meaningfully fake either. Every other test suite
+in this repo stays fully DB-free; scoping these fixtures to `tests/rag/`
+keeps that property visible.
+
+**`evaluation/`** — a hand-labelled retrieval eval set
+(`evaluation/datasets/retrieval_eval.jsonl`, one question → correct
+`(accession, item)` per line) and `evaluation/retrieval_eval.py`, computing
+recall@5 and NDCG@5 — this phase's literal exit criterion.
+
+**Measured result** (2026-09-21, against the real AAPL FY2023 10-K
+indexed via `scripts/rag_demo.py`, 10 questions after the correction
+below): **recall@5 = 0.900, NDCG@5 = 0.826.**
+
+The dataset originally had 15 questions built purely from the SEC's
+mandated Item-topic structure (e.g. "Item 1 = Business"), without reading
+each section's actual content first. The first real eval run scored
+0.600/15 with 6 misses; inspecting the indexed chunks showed 5 of those
+misses (Items 10-14: directors, compensation, ownership, related-party,
+accountant fees) were unanswerable by construction — Apple's 10-K answers
+all five with a single boilerplate line ("incorporated herein by
+reference" to the Proxy Statement), a common pattern for large filers who
+detail that information in a separate DEF 14A rather than the 10-K itself.
+Those 5 rows were removed with an explanation left in the dataset file for
+future labelling. The one remaining, genuine miss (Item 3, Legal
+Proceedings — which does contain real content, the Epic Games litigation)
+is an actual retrieval-quality finding, not a labelling error: Item 1A
+(Risk Factors) is both larger (more chunks competing for top-5 slots) and
+contains its own general "legal proceedings and government investigations"
+risk-factor language, which out-competed the dedicated Item 3 section on
+both legs of the hybrid search for that specific query.
+
+Not yet implemented: the remaining specialist agents (Filings, News,
+Competitive — Phase 4, which is what actually calls `hybrid_search`),
 valuation, the debate layer, the API, or the frontend. This file will grow
 with each phase — see `CLAUDE.md` §15 for the phase plan and §11 for the
 documentation standard this file follows.

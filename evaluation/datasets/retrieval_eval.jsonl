@@ -1,0 +1,34 @@
+# STARTER SET (15 of the ~30 CLAUDE.md §12 calls for) — every row below maps
+# a question to a section using the SEC's own mandated Item-topic structure
+# (true by regulation for any 10-K), not by reading and judging specific
+# paragraph content. The accession/items were confirmed real via a live
+# EdgarClient.get_filing_document call against AAPL's actual FY2023 10-K
+# during Phase 3 development (0000320193-23-000106, filed 2023-11-03,
+# items 1-16 present, 1C excluded by the confidence floor). Extending this
+# to ~30 with company-specific, content-level questions (e.g. a specific
+# risk factor's wording, a specific segment's revenue mix) is intentionally
+# left as manual work — CLAUDE.md's own framing ("an afternoon of
+# labelling") assumes a human reading the real filing, which this
+# dataset's remaining rows should be.
+{"question": "What does the company's business do, and what products and services does it sell?", "ticker": "AAPL", "as_of": "2024-06-30", "accession": "0000320193-23-000106", "item": "1", "notes": "Item 1 Business is SEC-mandated to cover this — a structural fact true for any 10-K, verified against the real accession via scripts/rag_demo.py's indexing run, not a guessed content-level answer."}
+{"question": "What risk factors could materially affect the company's business, results, or stock price?", "ticker": "AAPL", "as_of": "2024-06-30", "accession": "0000320193-23-000106", "item": "1A", "notes": "Item 1A Risk Factors, SEC-mandated topic."}
+{"question": "What real estate and facilities does the company own or lease?", "ticker": "AAPL", "as_of": "2024-06-30", "accession": "0000320193-23-000106", "item": "2", "notes": "Item 2 Properties, SEC-mandated topic."}
+{"question": "What material legal proceedings is the company currently involved in?", "ticker": "AAPL", "as_of": "2024-06-30", "accession": "0000320193-23-000106", "item": "3", "notes": "Item 3 Legal Proceedings, SEC-mandated topic."}
+{"question": "Where does the company's stock trade, and what is its dividend and share repurchase history?", "ticker": "AAPL", "as_of": "2024-06-30", "accession": "0000320193-23-000106", "item": "5", "notes": "Item 5 Market for Registrant's Common Equity, SEC-mandated topic."}
+{"question": "What is management's discussion and analysis of the company's financial condition and results of operations?", "ticker": "AAPL", "as_of": "2024-06-30", "accession": "0000320193-23-000106", "item": "7", "notes": "Item 7 MD&A, SEC-mandated topic."}
+{"question": "What is the company's exposure to market risk, such as interest rate or foreign currency risk?", "ticker": "AAPL", "as_of": "2024-06-30", "accession": "0000320193-23-000106", "item": "7A", "notes": "Item 7A Quantitative and Qualitative Disclosures About Market Risk, SEC-mandated topic."}
+{"question": "Where are the company's audited financial statements and supplementary financial data?", "ticker": "AAPL", "as_of": "2024-06-30", "accession": "0000320193-23-000106", "item": "8", "notes": "Item 8 Financial Statements and Supplementary Data, SEC-mandated topic."}
+{"question": "Has the company had any disagreements with its accountants on accounting or financial disclosure matters?", "ticker": "AAPL", "as_of": "2024-06-30", "accession": "0000320193-23-000106", "item": "9", "notes": "Item 9 Changes in and Disagreements with Accountants, SEC-mandated topic."}
+{"question": "What does management conclude about the effectiveness of the company's disclosure controls and internal control over financial reporting?", "ticker": "AAPL", "as_of": "2024-06-30", "accession": "0000320193-23-000106", "item": "9A", "notes": "Item 9A Controls and Procedures, SEC-mandated topic."}
+# Items 10-14 were dropped from this dataset after the first real eval run
+# (2026-09-21): a live query check of the indexed chunks showed Apple's
+# 10-K answers all five with a single boilerplate line ("The information
+# required by this Item will be included in the ... Proxy Statement, and
+# is incorporated herein by reference") — there is no real content in this
+# filing for hybrid_search to find, so questions asking for that content
+# were unanswerable by construction, not a retrieval failure. This is a
+# genuine, common 10-K pattern for large filers (director/compensation/
+# ownership detail lives in a separate DEF 14A, not the 10-K) worth knowing
+# about when labelling future rows: verify the target section actually
+# contains substantive content before writing a content-level question
+# against it, not just that the Item number exists.

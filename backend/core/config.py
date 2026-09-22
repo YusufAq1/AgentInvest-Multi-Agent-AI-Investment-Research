@@ -152,17 +152,77 @@ class Settings(BaseSettings):
     # docs/INTERVIEW_NOTES.md).
     financial_agent_max_tokens: int = 4096
 
+    # WHY 512/64: Phase 3's RAG chunking. 512 tokens keeps a chunk
+    # topically coherent (a query like "customer concentration" shouldn't
+    # have to compete against one embedding vector covering all of Item
+    # 1A) while staying well above the ~50-100 token floor where a chunk
+    # becomes too short to carry standalone meaning. 64 tokens (~12.5%
+    # overlap) preserves continuity across a boundary that splits a
+    # sentence or a claim spanning two chunks, without materially
+    # inflating storage/embedding cost. See backend/rag/chunking.py.
+    rag_chunk_max_tokens: int = 512
+    rag_chunk_overlap_tokens: int = 64
+
+    # WHY 0.6: edgartools' Section.confidence varies by detection_method
+    # ('toc' detection is high-confidence; 'pattern' detection is the
+    # weakest). Below this floor, chunking.py falls back to recomputing a
+    # section's char offsets via substring search rather than trusting
+    # edgartools' own start_offset/end_offset — the RAG-layer instance of
+    # this project's established "never trust an upstream API's own
+    # filtering/claims without a local, testable check" principle (see the
+    # as_of rechecks throughout backend/data). See ADR-0015.
+    rag_section_confidence_floor: float = 0.6
+
+    # WHY 60: the original Reciprocal Rank Fusion paper's (Cormack et al.
+    # 2009) empirically-chosen constant, adopted widely (e.g.
+    # Elasticsearch's own hybrid search defaults to it) because it
+    # flattens the impact of rank 1 vs rank 2 without needing a
+    # metric-specific calibration between cosine distance and ts_rank,
+    # which are on incompatible scales. See ADR-0014.
+    rag_rrf_k: int = 60
+    # WHY 5: Phase 3's literal exit criterion is "recall@5 measured and
+    # recorded" (CLAUDE.md §15).
+    rag_retrieval_top_k: int = 5
+    # WHY 20: each leg (dense, full-text) over-fetches beyond top_k before
+    # RRF fusion narrows back down — fusion needs more candidates per leg
+    # than the final result size to have anything meaningful to fuse.
+    rag_retrieval_candidate_k: int = 20
+
     @property
     def postgres_dsn(self) -> str:
-        """Single source of truth for the connection string.
+        """Single source of truth for the plain (sync-style) connection
+        string. Used by Alembic, which needs a direct, session-mode
+        connection for DDL and its own transactional/advisory-lock
+        behavior — see postgres_async_dsn's docstring for why the async
+        engine reuses the exact same fields rather than a separate pooled
+        DSN.
 
         WHY a property instead of a stored field: assembling it here means
         the individual POSTGRES_* vars (used directly by docker-compose.yml)
-        and the DSN (used by a future SQLAlchemy engine) can never drift
-        apart into two different sources of truth.
+        and the DSN (used by SQLAlchemy/Alembic) can never drift apart into
+        two different sources of truth.
         """
         password = self.postgres_password.get_secret_value()
         return (
             f"postgresql://{self.postgres_user}:{password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+
+    @property
+    def postgres_async_dsn(self) -> str:
+        """The asyncpg-driver DSN SQLAlchemy's async engine needs.
+
+        WHY the same host/port as postgres_dsn, not a separate pooled
+        (PgBouncer) connection: Supabase offers both a direct connection
+        and a transaction-mode pooled connection on a different port, but
+        this project deliberately uses the direct connection for
+        everything in Phase 3 — a single DSN shape is simpler, and
+        PgBouncer's transaction-mode pooling is a real optimization to
+        reach for once there's an actual concurrency need (e.g. Phase 5's
+        parallel agents hammering the DB), not before. See ADR-0013.
+        """
+        password = self.postgres_password.get_secret_value()
+        return (
+            f"postgresql+asyncpg://{self.postgres_user}:{password}"
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )

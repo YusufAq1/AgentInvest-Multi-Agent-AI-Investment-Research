@@ -160,3 +160,79 @@ never had enough history to reproduce the blowup. It's why the phase
 scripts (`hello_world.py`, `data_layer_demo.py`, `financial_agent_demo.py`)
 exist as a real end-to-end check alongside the test suite, not a
 redundant formality.
+
+## Why hybrid search (pgvector + full-text) instead of pure embeddings?
+
+Dense embeddings and keyword search fail in complementary ways. A query
+containing an exact ticker, dollar figure, or product name can score worse
+by cosine similarity than a vaguer, topically-related passage, because an
+embedding model compresses exact lexical detail into the same space as
+paraphrase — full-text search catches that trivially. The reverse also
+holds: a paraphrased query with no shared vocabulary scores zero on full-
+text search but is exactly what embeddings are built for. Fusing two
+ranked lists via Reciprocal Rank Fusion (`backend/rag/retrieval.py`,
+ADR-0014) sidesteps the harder problem of combining them into one query:
+cosine distance and Postgres `ts_rank` live on incompatible scales with no
+principled shared unit, so RRF only uses each list's *rank*, not its raw
+score, avoiding an arbitrary blending weight that couldn't be justified
+either way. `tests/rag/test_retrieval.py` proves the complementary-
+failure-mode claim directly, not just in theory: one seeded chunk is only
+findable via an exact keyword match with a deliberately orthogonal
+embedding, another is only findable via a matching embedding with zero
+shared vocabulary, and both surface correctly.
+
+## How do you validate section boundaries you didn't compute yourself?
+
+The honest answer involves a failed first attempt, which is a more useful
+interview answer than a clean success story. The original design trusted
+edgartools' `Section.start_offset`/`end_offset` when its own
+`confidence`/`detection_method` looked reliable, and otherwise fell back
+to locating the section's text via substring search inside the filing's
+separately-fetched full text — the same never-trust-upstream-blindly
+principle every `as_of` recheck in `backend/data` already applies, just
+extended to a new kind of claim.
+
+Running that against a real AAPL 10-K broke it completely: every
+section's `start_offset` was `0` (not usable global offsets at all), and
+the substring-search fallback also failed for every section, because
+edgartools extracts a section's text and the whole document's text
+through different internal code paths that turn out not to be
+byte-comparable, even when the underlying content is genuinely present in
+both. A test suite built only from small, hand-crafted fixtures never
+would have caught this — the fixture author controls both strings, so the
+search trivially succeeds in a way it never did against real data.
+
+The fix wasn't a smarter search — it was not needing one. `chunking.py`
+now reconstructs the filing's stored text FROM the sections
+(`build_full_text()`, concatenating each section's own text), so a
+chunk's char offset is computed while building that text, not searched
+for inside a separately-obtained one. There's no trust threshold and no
+failure mode left at the offset level — `confidence`/`detection_method`
+are still used, but to decide whether to bother chunking a section at all
+(skip ones edgartools itself flags as unreliably detected), not to decide
+whether to believe a location. Re-verified against the same real filing
+after the fix: 110 chunks, zero offset mismatches. See ADR-0015's revision
+history for the full account.
+
+## Why recall@5 instead of a generation-quality metric for this phase?
+
+Phase 3 deliberately stops at retrieval — nothing in it wires RAG into an
+agent yet (that's Phase 4's Filings Agent). Measuring recall@5 (does the
+labelled correct section appear in the top 5 results?) isolates whether
+the *retrieval* layer works at all, independent of anything an LLM might
+later do with what it retrieves. Combining retrieval and generation into
+one metric this early would make a retrieval bug and a generation bug
+indistinguishable from the same failing number.
+
+## Why Supabase instead of the docker-compose Postgres CLAUDE.md specifies?
+
+An honest discrepancy, not a silent one: Docker Desktop wasn't running in
+this project's dev environment when Phase 3 started, and rather than block
+all database-touching work on fixing that, a Supabase project (free tier,
+pgvector enabled by default) was used instead — reached via a plain direct
+Postgres connection (SQLAlchemy + asyncpg), not Supabase's REST client,
+since hybrid retrieval needs raw SQL (HNSW-ordered queries, `tsvector`
+predicates) that a REST layer doesn't expose cleanly. `docker-compose.yml`
+stays in the repo unchanged as a self-host fallback, and CI's test
+database is still the same `pgvector/pgvector:pg16` image it always
+was — only local day-to-day dev points at a different host. See ADR-0013.

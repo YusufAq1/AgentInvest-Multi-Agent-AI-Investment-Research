@@ -27,7 +27,7 @@ from backend.data.errors import (
     PermanentDataError,
     TransientDataError,
 )
-from backend.data.models import DataUnavailable, Filing
+from backend.data.models import DataUnavailable, Filing, FilingDocument, SectionMeta
 from backend.data.retry import with_retry
 
 
@@ -170,3 +170,99 @@ class EdgarClient:
         except (KeyError, TypeError) as exc:
             raise PermanentDataError(f"Section {section!r} not available") from exc
         return str(result)
+
+    async def get_filing_document(
+        self, filing: Filing, as_of: date
+    ) -> FilingDocument | DataUnavailable:
+        """Returns `filing`'s full text plus section-aware metadata for
+        every section edgartools detects — the input backend/rag/indexing.py
+        chunks. `get_filing_section` above stays as the single-named-section
+        reader; this answers "give me everything needed to chunk the whole
+        filing" instead.
+
+        Re-asserts `filing.filing_date <= as_of`, exactly like
+        `get_filing_section` — same defense against a caller reusing a stale
+        `Filing` object across a different `as_of`.
+        """
+        if filing.filing_date > as_of:
+            return DataUnavailable(
+                source="edgar",
+                identifier=filing.accession_number,
+                as_of=as_of,
+                reason=(
+                    f"Filing {filing.accession_number} was filed "
+                    f"{filing.filing_date}, after as_of {as_of}"
+                ),
+                attempted_at=datetime.now(UTC),
+            )
+
+        try:
+            document = await asyncio.to_thread(self._fetch_document_sync, filing)
+        except PermanentDataError:
+            return DataUnavailable(
+                source="edgar",
+                identifier=filing.accession_number,
+                as_of=as_of,
+                reason=f"No parseable document for filing {filing.accession_number}",
+                attempted_at=datetime.now(UTC),
+            )
+        return document
+
+    def _fetch_document_sync(self, filing: Filing) -> FilingDocument:
+        real_filing = edgar_find(filing.accession_number)
+        if not isinstance(real_filing, EdgarFiling):
+            raise PermanentDataError(
+                f"{filing.accession_number} did not resolve to a filing (got "
+                f"{type(real_filing).__name__})"
+            )
+        try:
+            # WHY the ignore: same undocumented-return-type gap as
+            # _fetch_section_sync's obj() call above.
+            obj = real_filing.obj()  # type: ignore[no-untyped-call]
+        except Exception as exc:
+            raise PermanentDataError(f"Failed to parse {filing.accession_number}") from exc
+        if obj is None:
+            # edgartools returns None from Filing.obj() for form types it
+            # has no typed report class for — not every filing form is
+            # chunkable, and that's an expected gap, not a bug.
+            raise PermanentDataError(f"{filing.accession_number}'s form has no report object")
+
+        document = obj.document
+        # WHY document.text() is never fetched here: see SectionMeta's and
+        # FilingDocument's docstrings — it isn't reliably relatable to any
+        # individual section's own text, confirmed against real filings,
+        # so fetching it here would be wasted work with no consumer.
+        sections = [
+            SectionMeta(
+                name=name,
+                title=section.title,
+                item=section.item,
+                part=section.part,
+                confidence=section.confidence,
+                detection_method=section.detection_method,
+                text=section.text(),
+            )
+            for name, section in document.sections.items()
+        ]
+        return FilingDocument(
+            sections=sections,
+            period_of_report=self._parse_period_of_report(obj.period_of_report),
+        )
+
+    @staticmethod
+    def _parse_period_of_report(value: object) -> date | None:
+        """edgartools documents `CompanyReport.period_of_report` as
+        `Optional[str]` (confirmed in the installed package's
+        attachments.py) — unlike CurrentReport/SixK, the base TenK/TenQ
+        path does not normalize it to a `date` internally. Parsed
+        defensively here rather than trusting a specific string format;
+        returns None (never fabricated) if it doesn't parse, per C6.
+        """
+        if value is None:
+            return None
+        if isinstance(value, date):
+            return value
+        try:
+            return date.fromisoformat(str(value).strip())
+        except ValueError:
+            return None

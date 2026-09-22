@@ -104,3 +104,60 @@ class EightKEvent(BaseModel):
     filing_date: date
     items: list[str]
     item_labels: list[str]
+
+
+class SectionMeta(BaseModel):
+    """One filing section's metadata, as edgartools' `Section` reports it.
+
+    WHY a plain local projection instead of importing edgartools' own
+    `Section` dataclass into backend.rag: decouples chunking.py (which
+    reads these fields) from edgartools' internal shape drifting across
+    versions, and keeps this module the single place that knows what a
+    "section" from an upstream filing-parsing library looks like — the
+    same reasoning `Filing` already applies to accession/form/date.
+
+    WHY there's no `start_offset`/`end_offset` here, despite edgartools'
+    `Section` exposing them: confirmed against a real AAPL 10-K that they
+    are NOT usable global offsets into `Document.text()` — every section
+    reported `start_offset=0`, because `Section.text()` and
+    `Document.text()` are extracted through different internal code paths
+    that aren't byte-comparable (confirmed: even a substring-search
+    fallback failed to relocate any section's text inside the separately
+    -extracted document text). See ADR-0015's revision history for the
+    full story and why `backend/rag/chunking.py` instead reconstructs its
+    own full text directly from these sections' own `text`, making
+    offsets correct by construction rather than something to locate.
+
+    `confidence`/`detection_method` ARE still used — not for offset trust
+    (there's no offset here to trust), but to skip sections edgartools
+    itself flags as unreliably detected (see `rag_section_confidence_floor`
+    in core/config.py). `detection_method` is typed as plain `str`, not a
+    Literal: edgartools' own set of values isn't part of its documented
+    public contract, and constraining it here would raise a validation
+    error on a legitimate value this project simply hasn't seen yet.
+    """
+
+    name: str
+    title: str | None
+    item: str | None
+    part: str | None
+    confidence: float
+    detection_method: str
+    text: str
+
+
+class FilingDocument(BaseModel):
+    """A filing's section-aware metadata — everything
+    `backend/rag/indexing.py` needs to chunk the whole filing.
+
+    WHY there's no separate `full_text` field here (unlike an earlier
+    version of this model): edgartools' `Document.text()` isn't reliably
+    relatable to any individual `Section.text()` (see `SectionMeta`'s
+    docstring) — the text this project actually stores and chunks against
+    is `backend.rag.chunking.build_full_text(sections)`, reconstructed
+    from these sections directly, not fetched separately. Fetching
+    `Document.text()` here would be extra work with no consumer.
+    """
+
+    sections: list[SectionMeta]
+    period_of_report: date | None
