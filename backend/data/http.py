@@ -41,6 +41,11 @@ class SecRateLimiter:
     real rate to SEC could momentarily exceed the 10/s ceiling. A
     cross-process shared limiter isn't justified at this scale — this is a
     documented, accepted simplification, not an oversight.
+
+    Phase 5 update: agents now genuinely run concurrently, so this gap is
+    reachable in a normal run. edgartools' rate can't be lowered from our
+    config: it only reads EDGAR_RATE_LIMIT_PER_SEC from the environment at
+    first import. See ADR-0001.
     """
 
     def __init__(self, requests_per_second: int) -> None:

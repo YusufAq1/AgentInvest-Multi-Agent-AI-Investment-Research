@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from decimal import Decimal
 from typing import Any, Protocol, TypeVar
 
@@ -131,6 +131,15 @@ def compute_cost(usage: UsageLike, pricing: ModelPricing) -> Decimal:
     ) / mtok
 
 
+def total_cost(results: Iterable[LLMCallResult]) -> Decimal:
+    """Sum the cost of a set of calls — e.g. every call one research run
+    made. Pure and trivially testable, same reasoning as `compute_cost`:
+    CLAUDE.md §5 wants "what does one research run cost?" answered with a
+    number Python computed, not a guess.
+    """
+    return sum((result.cost_usd for result in results), Decimal("0"))
+
+
 class LLMCallResult(BaseModel):
     """Everything about one Claude call worth knowing after the fact."""
 
@@ -154,13 +163,34 @@ class ClaudeClient:
     site. The `client` constructor parameter lets tests inject a fake SDK
     client — `ClaudeClient(settings, client=<mock>)` — so no test in this
     project ever makes a real network call.
+
+    `on_result`, if given, is called with every `LLMCallResult` this client
+    produces — once per underlying API call, so a `call_structured` retry
+    reports two. WHY a callback rather than returning cost from
+    `call_structured`: that method is deliberately generic (it returns the
+    caller's own Pydantic model), and every agent would otherwise need its
+    signature changed just to thread cost back out. The orchestration layer
+    (Phase 5) gives each agent node its own client whose callback appends
+    to a per-node list, so a run's cost is collected as data in the graph
+    state — replacing the Phase 2-4 demos' trick of scraping cost back out
+    of log records, which would mix two concurrent runs' costs together.
+    Called from whatever thread made the call (agents run
+    `call_structured` via `asyncio.to_thread`, ADR-0019), so it must be
+    thread-safe; `list.append` is.
     """
 
-    def __init__(self, settings: Settings, client: anthropic.Anthropic | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        client: anthropic.Anthropic | None = None,
+        *,
+        on_result: Callable[[LLMCallResult], None] | None = None,
+    ) -> None:
         self._settings = settings
         self._client = client or anthropic.Anthropic(
             api_key=settings.anthropic_api_key.get_secret_value()
         )
+        self._on_result = on_result
 
     def call(
         self,
@@ -416,4 +446,6 @@ class ClaudeClient:
                 "cost_usd": str(result.cost_usd),
             },
         )
+        if self._on_result is not None:
+            self._on_result(result)
         return response, result

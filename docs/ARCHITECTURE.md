@@ -23,7 +23,7 @@ LLM call:
    rates, DCF, confidence scores — is a pure, unit-tested Python function.
    The LLM interprets results; it never computes them.
 
-## Current status: Phase 4 — Filings, News, Competitive agents
+## Current status: Phase 5 (Increment 5a) — LangGraph orchestration
 
 ### Phase 0 — Foundation
 - `backend/core/config.py` — process settings (Anthropic key, default
@@ -325,8 +325,75 @@ lost, duplicated, or cross-attributed to the wrong agent.
 run against real APIs — the visible confirmation the fix actually
 shortens wall time, not just "doesn't crash."
 
-Not yet implemented: the Research Manager and orchestration layer (Phase
-5, the LangGraph decision point), valuation, the debate layer, the API, or
-the frontend. This file will grow with each phase — see `CLAUDE.md` §15
+### Phase 5 — Orchestration (`backend/orchestration/`)
+
+**Increment 5a: LangGraph runner with a deterministic plan.** ADR-0001
+records the decision to adopt LangGraph now, earlier than §15's own trigger,
+and says so honestly. `docs/LANGGRAPH_CONCEPTS.md` explains the concepts.
+
+```
+START -> plan -> (fan-out) financial | filings | news | competitive -> collect -> END
+```
+
+- **`state.py`**: `ResearchState`, a TypedDict with `operator.add`
+  reducers on `evidence`, `claims`, `dropped_claims`, `agent_outcomes` and
+  `llm_calls`, so parallel agent updates concatenate. It also defines
+  `ResearchPlan` (`routes`, `skipped`, `filings_questions`, `source`) and
+  `AgentOutcome` (`succeeded`/`failed`/`skipped`, counts, duration,
+  detail). `CHECKPOINT_TYPES` is the serializer allowlist.
+- **`planning.py`**: `deterministic_plan()`. It routes every agent, skips
+  Competitive when the ticker isn't in `PEER_MAP`, and gives Filings the
+  default questions. This is 5a's only planner and becomes 5b's recorded
+  fallback.
+- **`graph.py`**: `build_research_graph(deps, checkpointer)`.
+  - Each agent node builds a private `EvidenceStore` and a `ClaudeClient`
+    whose `on_result` collects that node's calls. It runs the unchanged
+    agent and returns its output as a state update.
+  - The node is the run's only failure **bulkhead**: `except Exception`
+    becomes `AgentOutcome(status="failed")`, other agents continue, and the
+    cost already spent is kept.
+  - **`collect`** rebuilds one merged store and re-runs `add_evidence`
+    (C3) and `add_claim` (§6 rule 2) over everything, raising on any
+    violation.
+  - Agents are built through `RunDependencies.agent_factories`. That's
+    also the test seam.
+- **`runner.py`**:
+  - `open_run_dependencies()` creates one shared `SecHttpClient` per run,
+    since the rate limiter is per instance.
+  - `open_checkpointer()` opens `AsyncPostgresSaver` on psycopg 3, runs
+    `setup()` idempotently, and applies the serializer allowlist.
+  - `start_run()` / `resume_run()` stream `plan_ready`, `agent_started`,
+    `agent_finished` and `run_collected` events. `thread_id = run_id`.
+- **`scripts/run_research.py`**: the one command. It supports
+  `--ticker/--as-of` or `--resume <run_id>`, prints progress with elapsed
+  time, a per-agent outcome table, the claims, the total cost and the §18
+  disclaimer (`backend/core/disclaimer.py`). It runs on a
+  `SelectorEventLoop` on Windows, because psycopg's async mode rejects
+  Proactor.
+- **Supporting changes:**
+  - `ClaudeClient(on_result=...)` and `total_cost()` in `core/llm.py`,
+    replacing the demos' log-scraping cost collector
+  - a `research_questions` constructor argument on `FilingsAgent`
+  - Alembic `include_object` excludes LangGraph's `checkpoint*` tables
+
+**Tests:**
+- `tests/orchestration/test_graph.py` is DB-free, using `InMemorySaver`
+  with the production serializer. It covers attribution, cost summing, the
+  failure bulkhead, the peer-map skip, event ordering, as_of leakage,
+  `collect` rejecting a fabricated citation and leaked evidence, resume
+  without rerunning finished agents, and the serializer round-trip and
+  allowlist.
+- `tests/orchestration/test_checkpointer_postgres.py` round-trips a run's
+  state through real Postgres across two connections.
+
+**Known gaps, documented in ADR-0001:**
+- A Claude call inside an *interrupted* node is paid but not checkpointed.
+  It's still in the JSON log, but the `llm_calls` table (§14) is still not
+  built.
+- The SEC combined-rate gap (`backend/data/http.py`) is now reachable
+  under real concurrency.
+
+Not yet implemented: the LLM Research Manager (Increment 5b), valuation,
+the debate layer, the API, or the frontend. This file will grow with each phase — see `CLAUDE.md` §15
 for the phase plan and §11 for the documentation standard this file
 follows.

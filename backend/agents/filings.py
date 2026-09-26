@@ -1,7 +1,8 @@
 """The Filings Agent: the first real consumer of Phase 3's RAG pipeline
-(backend/rag/). Orchestrates fetch -> index -> hybrid_search itself, since
-no Manager/orchestrator exists yet (Phase 5) to hand it a pre-indexed
-filing or a dynamic set of research questions.
+(backend/rag/). Orchestrates fetch -> index -> hybrid_search itself. Since Phase 5 the
+research questions it searches for are supplied by the orchestration
+layer's plan (see backend/orchestration/planning.py); indexing still
+happens here, per run.
 
 Same anti-fabrication design as every other agent: Python builds every
 Evidence row (a verbatim chunk of stored filing text, at a real char
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Sequence
 from datetime import UTC, date, datetime
 from typing import Final
 from uuid import UUID, uuid4
@@ -32,12 +34,14 @@ from backend.rag.retrieval import RetrievedChunk, hybrid_search, resolve_chunk_c
 
 logger = logging.getLogger("agentinvest.agents.filings")
 
-# WHY a fixed, hardcoded set rather than something dynamic/configurable: no
-# Manager exists yet (Phase 5) to supply real, ticker-specific research
-# questions. This is a documented first-cut default the Manager replaces,
-# not a considered ceiling — same category of module-level, curated
-# constant as backend/agents/xbrl_facts.py's CONCEPT_ALIASES.
-_DEFAULT_RESEARCH_QUESTIONS: Final[tuple[str, ...]] = (
+# WHY a fixed, curated default: it's what the agent uses when nobody hands
+# it ticker-specific questions. Since Phase 5 the orchestration layer passes
+# questions in via the constructor (the deterministic plan passes exactly
+# these; Increment 5b's LLM Research Manager writes its own). Public, not
+# `_`-prefixed, because backend/orchestration/planning.py reads it too —
+# same category of module-level, curated constant as
+# backend/agents/xbrl_facts.py's CONCEPT_ALIASES.
+DEFAULT_RESEARCH_QUESTIONS: Final[tuple[str, ...]] = (
     "What are the company's most significant risk factors?",
     "How does the company describe competition in its industry?",
     "What legal proceedings is the company currently involved in?",
@@ -69,12 +73,23 @@ class FilingsAgent:
         claude: ClaudeClient,
         store: EvidenceStore,
         settings: Settings,
+        research_questions: Sequence[str] | None = None,
     ) -> None:
+        """`research_questions`: the hybrid-search queries to run against
+        the indexed filing. None means DEFAULT_RESEARCH_QUESTIONS. WHY a
+        constructor argument rather than a new `run()` parameter: every
+        agent satisfies the shared `ResearchAgent` Protocol's
+        `run(ticker, as_of)`, and the orchestrator builds a fresh agent per
+        run anyway, so per-run configuration belongs at construction.
+        """
         self._edgar = edgar
         self._session_factory = session_factory
         self._claude = claude
         self._store = store
         self._settings = settings
+        self._research_questions: tuple[str, ...] = tuple(
+            research_questions if research_questions is not None else DEFAULT_RESEARCH_QUESTIONS
+        )
 
     @property
     def agent_name(self) -> str:
@@ -131,7 +146,7 @@ class FilingsAgent:
         # Agent's lazy evidence construction, applied to a different
         # failure shape.
         unique_chunks: dict[UUID, RetrievedChunk] = {}
-        for question in _DEFAULT_RESEARCH_QUESTIONS:
+        for question in self._research_questions:
             hits = await hybrid_search(
                 query=question,
                 ticker=ticker,

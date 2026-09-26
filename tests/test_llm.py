@@ -21,8 +21,10 @@ from backend.core.llm import (
     ClaudeRateLimitError,
     ClaudeRefusalError,
     ClaudeTruncatedToolCallError,
+    LLMCallResult,
     StructuredOutputError,
     compute_cost,
+    total_cost,
 )
 from pydantic import BaseModel
 
@@ -318,3 +320,44 @@ def test_call_structured_builds_tool_schema_from_model() -> None:
     tool = call_kwargs["tools"][0]
     assert tool["name"] == "emit_point"
     assert tool["input_schema"] == _Point.model_json_schema()
+
+
+def test_on_result_fires_once_per_api_call_including_the_retry() -> None:
+    """Phase 5's per-run cost comes from this callback, so a retry must be
+    reported as the second paid call it really is, not folded into one."""
+    settings = make_settings()
+    mock_sdk_client = MagicMock()
+    bad = _fake_tool_response({"x": 1}, tool_use_id="toolu_bad", input_tokens=100)
+    good = _fake_tool_response({"x": 1, "y": 2}, input_tokens=200)
+    mock_sdk_client.messages.create.side_effect = [bad, good]
+    seen: list[LLMCallResult] = []
+    client = ClaudeClient(settings, client=mock_sdk_client, on_result=seen.append)
+
+    client.call_structured(
+        agent="test_agent",
+        model_cls=_Point,
+        messages=[{"role": "user", "content": "go"}],
+        tool_name="emit_point",
+        tool_description="emit a point",
+    )
+
+    assert [r.input_tokens for r in seen] == [100, 200]
+    assert all(r.agent == "test_agent" for r in seen)
+
+
+def test_total_cost_sums_hand_worked_values() -> None:
+    def _result(cost: str) -> LLMCallResult:
+        return LLMCallResult(
+            agent="a",
+            model="m",
+            input_tokens=0,
+            output_tokens=0,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+            latency_ms=0.0,
+            cost_usd=Decimal(cost),
+            text="",
+        )
+
+    assert total_cost([]) == Decimal("0")
+    assert total_cost([_result("0.001250"), _result("0.000500")]) == Decimal("0.001750")

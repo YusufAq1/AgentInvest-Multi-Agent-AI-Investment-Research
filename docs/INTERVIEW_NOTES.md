@@ -305,3 +305,63 @@ what it doesn't: the correctness assertions would have passed even before
 the `asyncio.to_thread` fix (nothing about them depends on genuine
 overlap) — proving genuine wall-clock overlap is what
 `scripts/phase4_agents_demo.py`'s timing print is for instead.
+
+(Phase 5 update: the shared store is gone. Each agent node now has its own
+store, and the outputs merge through LangGraph reducers. See the next
+questions and ADR-0001.)
+
+## Why LangGraph, if your graph is only plan → four parallel agents → collect?
+
+Honestly, the graph alone doesn't justify it, and the ADR says so. My own
+spec set the bar at more than about three conditional branches or a need
+for resumable state, and Phase 5 has one branch and no loops. I adopted it
+early for three reasons.
+- Phase 7's critic loop is a conditional back-edge that crosses the bar
+  anyway, and I'd rather not migrate while building the debate layer.
+- `astream` is exactly the progress stream Phase 8's SSE endpoint needs.
+- Checkpointing gives resumable runs for free.
+
+The real cost was design, not code: checkpointed state must be
+serialisable. So the shared `EvidenceStore` became per-agent stores whose
+output merges through reducers, plus a fan-in node that re-validates
+everything. I also took on a second Postgres driver, psycopg, because the
+checkpointer requires it (ADR-0001).
+
+## What happens if one agent crashes mid-run?
+
+That agent's node catches the exception and records an `AgentOutcome` with `status="failed"` and the
+error. The other agents finish normally. The failed agent contributes no
+claims or evidence, because half an agent's output is harder to reason
+about than none. But the Claude cost it already spent is kept, because
+that money was really spent. The failure isn't hidden: it's in the outcome
+table the CLI prints, and it's what Phase 7's `data_completeness` score
+will read. Ctrl-C is different: it's a `BaseException`, so it propagates
+and the run can be resumed.
+
+Broad `except Exception` exists in only three kinds of place, each with a
+WHY comment: the edgartools and yfinance boundaries in the data layer
+(third-party libraries with no documented exception contract), and this
+agent bulkhead. Everywhere else catches a named exception type.
+
+## How do you know what one research run cost?
+
+Every Claude call goes through `ClaudeClient`, which prices it from a
+config table. Each agent node gets its own client with an `on_result`
+callback that appends the call's `LLMCallResult` to the node's state
+update. A run's cost is `total_cost(state["llm_calls"])`, a pure sum,
+printed at the end of every run. Before Phase 5, the demos scraped cost
+out of log records with a global handler, which would have mixed two
+concurrent runs together. One known under-count: a call made inside a node
+that gets interrupted before returning is paid but never checkpointed. It's
+still in the JSON log, and a per-call `llm_calls` table would close the gap.
+
+## How is a run resumed after a crash?
+
+LangGraph checkpoints the state to Postgres after every superstep, keyed by
+`thread_id`, which I set to the `run_id`. It also records each finished
+node's result within a superstep. `run_research.py --resume <run_id>`
+rebuilds the graph with fresh clients and continues that thread. Agents
+that already finished aren't rerun or re-paid; only the interrupted ones
+run again. A test proves this by interrupting one of four parallel agents
+and asserting the other three were built exactly once across both
+attempts.
