@@ -236,3 +236,72 @@ predicates) that a REST layer doesn't expose cleanly. `docker-compose.yml`
 stays in the repo unchanged as a self-host fallback, and CI's test
 database is still the same `pgvector/pgvector:pg16` image it always
 was — only local day-to-day dev points at a different host. See ADR-0013.
+
+## Why can't the Competitive Agent state a market-share number?
+
+Structurally, not just by instruction: no data source in this project
+(there's no free market-share/TAM API — CLAUDE.md's own data-source table
+has no such row) can produce that figure, so Python never creates a
+market-share `Evidence` row, so Claude can never cite one, and
+`EvidenceStore.validate_claim_batch` rejects any `claim_type="evidence"`
+attempt at one the same way it rejects any hallucinated citation — the
+identical mechanism that makes every other agent's claims impossible to
+fabricate, not a special case built for this rule.
+
+There's one gap that mechanism doesn't close on its own: an
+`"inference"`/`"assumption"` claim can cite *real* revenue evidence while
+asserting an unrelated market-share conclusion (e.g. "revenue is 3x
+theirs, so we hold 60% of the market") — those claim types aren't checked
+for whether their cited evidence actually supports the specific thing
+being asserted, by design (CLAUDE.md §6 rule 5 treats them as judgement,
+not verifiable fact). That gap is closed by an explicit prompt
+instruction instead, which is honestly weaker than a structural
+guarantee — worth watching in real runs, not assumed solved. See
+ADR-0018.
+
+## Why is the News Agent's citation a formatted string instead of the actual 8-K text?
+
+Because `NewsClient` (Phase 1) never fetches an 8-K's narrative body —
+only structured item-code metadata (accession, filing date, item codes,
+their SEC labels), a deliberate scoping decision documented in its own
+module docstring, not an oversight this phase quietly inherited. The News
+Agent's `Evidence.quote` is a deterministic string built only from those
+real fields — `"8-K filed {date} (accession {accession}): 1.03
+(Bankruptcy or Receivership)"` — the same category of construction as a
+`"computed"` ratio's `f"{name} = {formula} = {value}"` string, never
+freeform prose Claude could have written itself.
+
+The honest cost: this makes the citation-validity containment check
+tautological for `news` evidence specifically — the "document" checked
+against is the same string as the quote, since there's nothing separately
+fetched to check it against. I could have hidden that, but the real
+anti-fabrication guarantee here (as everywhere else) is structural —
+Claude only cites an `evidence_id`, it never writes a quote — so saying
+plainly that the containment check adds nothing extra for this one source
+type is more honest than implying a symmetry with `sec_filing` evidence's
+check that doesn't actually carry the same weight. See ADR-0017.
+
+## How do you prove agents actually run in parallel, given a shared, mutable Evidence Store?
+
+Two layers. First, a real bug had to be found and fixed before the claim
+was even true: `ClaudeClient.call_structured` wraps a synchronous
+Anthropic client, and the Financial Agent called it directly inside
+`async def run()` — invisible with one agent, but it would have silently
+serialized every "concurrent" agent's Claude call behind whichever ran
+first under `asyncio.gather`. Wrapping the call in `asyncio.to_thread`
+across all four agents actually makes the concurrency real (ADR-0019).
+
+Second, `tests/agents/test_parallel_execution.py` is the automated proof:
+all four agents share one `EvidenceStore` instance, run concurrently via
+`asyncio.gather`, and the test asserts every claim/evidence row lands
+correctly — nothing lost, nothing duplicated, nothing cross-attributed to
+the wrong agent. This works safely with no new locking code because
+`EvidenceStore`'s methods are fully synchronous between `await` points —
+Python's cooperative scheduling guarantees one coroutine's method call
+completes before another's begins, so a shared mutable dict-backed store
+is safe under concurrent async use by construction, not by careful manual
+synchronization. Worth being precise about what the test proves versus
+what it doesn't: the correctness assertions would have passed even before
+the `asyncio.to_thread` fix (nothing about them depends on genuine
+overlap) — proving genuine wall-clock overlap is what
+`scripts/phase4_agents_demo.py`'s timing print is for instead.

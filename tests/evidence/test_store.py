@@ -9,7 +9,7 @@ from backend.evidence.errors import (
     EvidenceRunMismatchError,
     LookAheadEvidenceError,
 )
-from backend.evidence.models import Claim, Evidence
+from backend.evidence.models import Claim, ClaimBatch, Evidence
 from backend.evidence.store import EvidenceStore
 
 RUN_ID = uuid4()
@@ -119,6 +119,47 @@ def test_record_dropped_claim_round_trips() -> None:
     dropped = store.dropped_claims()
     assert len(dropped) == 1
     assert dropped[0].reason == "validation failed twice"
+
+
+def test_validate_claim_batch_passes_when_all_evidence_resolves() -> None:
+    store = EvidenceStore(run_id=RUN_ID, as_of=AS_OF)
+    ev = _make_evidence()
+    store.add_evidence(ev)
+    batch = ClaimBatch(
+        claims=[
+            Claim(
+                id=uuid4(),
+                agent="financial",
+                statement="Revenue was $100",
+                evidence_ids=[ev.id],
+                claim_type="evidence",
+                materiality="high",
+            )
+        ]
+    )
+
+    store.validate_claim_batch(batch)  # does not raise
+
+
+def test_validate_claim_batch_raises_value_error_for_unknown_evidence_id() -> None:
+    store = EvidenceStore(run_id=RUN_ID, as_of=AS_OF)
+    batch = ClaimBatch(
+        claims=[
+            Claim(
+                id=uuid4(),
+                agent="financial",
+                statement="Revenue was $100",
+                evidence_ids=[uuid4()],
+                claim_type="evidence",
+                materiality="high",
+            )
+        ]
+    )
+
+    # WHY ValueError, not EvidenceNotFoundError: call_structured's
+    # extra_validation contract requires ValueError to trigger its retry.
+    with pytest.raises(ValueError, match="No evidence found"):
+        store.validate_claim_batch(batch)
 
 
 def test_all_evidence_filters_by_source_type() -> None:

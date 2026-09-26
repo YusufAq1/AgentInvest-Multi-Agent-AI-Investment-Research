@@ -21,7 +21,7 @@ from backend.evidence.errors import (
     EvidenceRunMismatchError,
     LookAheadEvidenceError,
 )
-from backend.evidence.models import Claim, DroppedClaim, Evidence
+from backend.evidence.models import Claim, ClaimBatch, DroppedClaim, Evidence
 
 
 class EvidenceStore:
@@ -102,6 +102,22 @@ class EvidenceStore:
         """
         self.resolve(claim.evidence_ids)
         self._claims[claim.id] = claim
+
+    def validate_claim_batch(self, batch: ClaimBatch) -> None:
+        """Bridges `resolve`'s `EvidenceNotFoundError` into the `ValueError`
+        `ClaudeClient.call_structured`'s `extra_validation` contract
+        requires to trigger its retry-with-feedback flow (CLAUDE.md §6
+        rule 4). Every agent's `emit_claims` call passes this method
+        directly as `extra_validation` — originally a private, duplicated
+        function in `backend/agents/financial.py`, moved here once a
+        second, third, and fourth agent (Phase 4) needed byte-identical
+        logic (CLAUDE.md §17: don't duplicate agents' shared plumbing).
+        """
+        for claim in batch.claims:
+            try:
+                self.resolve(claim.evidence_ids)
+            except EvidenceNotFoundError as exc:
+                raise ValueError(str(exc)) from exc
 
     def record_dropped_claim(self, *, agent: str, raw_input: dict[str, Any], reason: str) -> None:
         """CLAUDE.md §6 rule 4: "record the drop" — never a silent discard."""

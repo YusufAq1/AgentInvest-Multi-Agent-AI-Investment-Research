@@ -23,7 +23,7 @@ LLM call:
    rates, DCF, confidence scores — is a pure, unit-tested Python function.
    The LLM interprets results; it never computes them.
 
-## Current status: Phase 3 — RAG over filings
+## Current status: Phase 4 — Filings, News, Competitive agents
 
 ### Phase 0 — Foundation
 - `backend/core/config.py` — process settings (Anthropic key, default
@@ -251,8 +251,82 @@ contains its own general "legal proceedings and government investigations"
 risk-factor language, which out-competed the dedicated Item 3 section on
 both legs of the hybrid search for that specific query.
 
-Not yet implemented: the remaining specialist agents (Filings, News,
-Competitive — Phase 4, which is what actually calls `hybrid_search`),
-valuation, the debate layer, the API, or the frontend. This file will grow
-with each phase — see `CLAUDE.md` §15 for the phase plan and §11 for the
-documentation standard this file follows.
+### Phase 4 — Filings, News, Competitive agents (`backend/agents/`)
+
+**Shared plumbing extracted first** (ADR-0016): Financial Agent's private
+XBRL alias/period-matching helpers moved to `backend/agents/xbrl_facts.py`
+(`CONCEPT_ALIASES`, `select_anchor`, `select_matching`, `select_prior_year`
+— renamed from `_`-prefixed originals) once the Competitive Agent needed
+the identical logic; `_validate_claim_batch`'s `EvidenceNotFoundError`→
+`ValueError` bridge moved onto `EvidenceStore` itself
+(`EvidenceStore.validate_claim_batch`) once four agents needed it
+verbatim. Both extractions are confirmed behavior-preserving —
+`tests/agents/test_financial.py` passes unmodified.
+
+**`backend/agents/filings.py`** — the first real consumer of Phase 3's RAG
+pipeline. Orchestrates fetch → `index_filing` → `hybrid_search` itself
+(no Manager exists yet to hand it pre-indexed data), against a hardcoded
+set of 5 default research questions (a documented first-cut default,
+module constant, same category as `xbrl_facts.py`'s `CONCEPT_ALIASES`).
+Deduplicates hits by `chunk_id` across questions before building Evidence
+— the same "don't blow up evidence count" discipline as the Financial
+Agent's lazy construction, applied to a different failure shape (one
+chunk legitimately answering more than one question). `backend/rag/
+retrieval.py` gained two new functions for this: `resolve_chunk_citation`
+(fetches the `char_start`/`char_end`/`document_id` `RetrievedChunk`
+deliberately doesn't carry) and `get_full_text_by_accession` (feeds the
+`documents={accession: full_text}` mapping citation-validity checks need)
+— both DB-touching, so they live in `retrieval.py`, not the DB-free
+`backend/evidence/validation.py`, which needed zero changes: its
+`("sec_filing", "news")` containment branch already accepted a caller
+-supplied `documents` mapping.
+
+**`backend/agents/news.py`** — classifies 8-K materiality from structured
+item-code metadata only (`NewsClient` never fetches narrative text — a
+deliberate Phase 1 scoping decision, not a gap this phase papers over).
+Citation quote is a deterministic, Python-constructed canonical string
+(`"8-K filed {date} (accession {accession}): {code} ({label}); ..."`),
+the same category of construction as `"computed"` evidence's formula
+string — never freeform prose Claude could have written. This makes the
+citation-validity containment check tautological for `news` evidence
+(quote and "document" are the same string) — an accepted, explicitly
+documented tradeoff, not a hidden one. See ADR-0017 for the full
+reasoning and the honest fidelity gap this leaves (no ability to cite
+specific narrative detail from inside an 8-K).
+
+**`backend/agents/competitive.py`** — compares a ticker's XBRL revenue and
+net margin against a hand-curated peer map (`backend/agents/peer_map.py`,
+a starter set of 5 large caps — SIC-code lookup was rejected as
+misclassifying modern large-caps; see ADR-0018). Market-share enforcement
+needed zero new validation code: no data source in this project can
+produce market-share/TAM figures, so Python never creates that Evidence,
+so Claude can never cite one, so `validate_claim_batch` structurally
+rejects any `claim_type="evidence"` attempt. The one gap this doesn't
+close — an `"inference"` claim citing real revenue evidence while
+asserting an unrelated market-share number — is closed by an explicit
+prompt instruction instead, since `inference`/`assumption` claims aren't
+checked for whether their evidence actually supports the specific
+assertion (CLAUDE.md §6 rule 5).
+
+**The concurrency fix** (ADR-0019): investigating what "parallel execution
+works" actually requires surfaced that `ClaudeClient.call_structured`
+wraps the synchronous `anthropic.Anthropic` client, and the Financial
+Agent (Phase 2) called it directly inside `async def run()` — invisible
+with one agent, but under `asyncio.gather` it would serialize every
+concurrently-"running" agent's Claude call behind whichever one runs
+first. Fixed by wrapping the call in `asyncio.to_thread` in all four
+agents' `_emit_claims` (now `async def`) — purely non-functional, and
+`test_financial.py`'s existing assertions needed no changes.
+`tests/agents/test_parallel_execution.py` is the direct, automated proof:
+all four agents share one `EvidenceStore`, run via `asyncio.gather`, and
+every claim/evidence row is confirmed to land correctly with nothing
+lost, duplicated, or cross-attributed to the wrong agent.
+`scripts/phase4_agents_demo.py` prints real wall-clock timing for a live
+run against real APIs — the visible confirmation the fix actually
+shortens wall time, not just "doesn't crash."
+
+Not yet implemented: the Research Manager and orchestration layer (Phase
+5, the LangGraph decision point), valuation, the debate layer, the API, or
+the frontend. This file will grow with each phase — see `CLAUDE.md` §15
+for the phase plan and §11 for the documentation standard this file
+follows.

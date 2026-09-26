@@ -19,6 +19,7 @@ from pydantic import BaseModel
 from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from backend.core.llm import AgentInvestError
 from backend.db.models import Document, DocumentChunk
 from backend.db.session import session_scope
 from backend.rag.embeddings import embed_texts
@@ -28,7 +29,15 @@ class RetrievedChunk(BaseModel):
     """One hybrid-search result, with each leg's rank kept separate (not
     just a final blended score) — needed for eval transparency (the demo
     script and evaluation/retrieval_eval.py both show dense vs full-text
-    contribution per result, not just the fused ranking)."""
+    contribution per result, not just the fused ranking).
+
+    WHY this deliberately carries no `char_start`/`char_end`/`document_id`:
+    it's a ranking/display projection, not a citation-grade one — a caller
+    that needs to build a verbatim, offset-locatable Evidence row (Phase
+    4's Filings Agent) calls `resolve_chunk_citation` for that, keeping
+    this type's shape stable for the (cheaper, more common) case of just
+    showing/ranking results.
+    """
 
     chunk_id: UUID
     text: str
@@ -38,6 +47,33 @@ class RetrievedChunk(BaseModel):
     dense_rank: int | None
     fulltext_rank: int | None
     rrf_score: float
+
+
+class ChunkCitation(BaseModel):
+    """Everything needed to build a verbatim, offset-locatable `Evidence`
+    row from a `hybrid_search` hit — the citation-grade projection
+    `RetrievedChunk` deliberately isn't (see its docstring).
+    """
+
+    chunk_id: UUID
+    document_id: UUID
+    accession: str
+    item: str | None
+    filing_date: date
+    fiscal_period: str | None
+    char_start: int
+    char_end: int
+    text: str  # == chunk.text; a substring of Document.full_text by
+    # chunking.py's construction (see its module docstring) — never
+    # re-derived by slicing full_text here.
+
+
+class ChunkNotFoundError(AgentInvestError):
+    """`resolve_chunk_citation` was given a `chunk_id` that doesn't resolve
+    to a real `document_chunks` row — should never happen for a chunk_id
+    `hybrid_search` just returned in the same run; not silently swallowed
+    if it somehow does (C6's spirit applied to a bug, not just missing
+    external data)."""
 
 
 async def hybrid_search(
@@ -88,6 +124,48 @@ async def hybrid_search(
         )
         for chunk_id, score in fused
     ]
+
+
+async def resolve_chunk_citation(
+    chunk_id: UUID, *, session_factory: async_sessionmaker[AsyncSession]
+) -> ChunkCitation:
+    """Fetches the one `document_chunks` row `hybrid_search`'s
+    `RetrievedChunk` didn't carry enough of to cite from directly (no
+    `char_start`/`char_end`/`document_id`/`fiscal_period`). Raises
+    `ChunkNotFoundError` if `chunk_id` doesn't resolve.
+    """
+    async with session_scope(session_factory) as session:
+        row = await session.get(DocumentChunk, chunk_id)
+    if row is None:
+        raise ChunkNotFoundError(f"No document_chunks row for chunk_id={chunk_id}")
+    return ChunkCitation(
+        chunk_id=row.id,
+        document_id=row.document_id,
+        accession=row.accession,
+        item=row.item,
+        filing_date=row.filing_date,
+        fiscal_period=row.fiscal_period,
+        char_start=row.char_start,
+        char_end=row.char_end,
+        text=row.text,
+    )
+
+
+async def get_full_text_by_accession(
+    accession: str, *, session_factory: async_sessionmaker[AsyncSession]
+) -> str | None:
+    """Fetches `Document.full_text` by accession — the one piece of I/O
+    plumbing needed to build the `documents={accession: full_text}`
+    mapping `backend.evidence.validation.validate_all_evidence` needs for
+    its `sec_filing` containment check (`validation.py` itself stays
+    DB-free by design — see its module docstring). Returns `None`, not an
+    exception, if no `Document` row exists for this accession.
+    """
+    async with session_scope(session_factory) as session:
+        full_text = await session.scalar(
+            select(Document.full_text).where(Document.accession == accession)
+        )
+    return full_text
 
 
 def _dense_query(

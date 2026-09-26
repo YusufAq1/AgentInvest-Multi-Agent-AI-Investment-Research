@@ -14,111 +14,32 @@ enforcement live).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from json import dumps as json_dumps
-from typing import Final
 from uuid import uuid4
 
 from backend.agents.prompt_loader import load_prompt
+from backend.agents.xbrl_facts import (
+    ALL_ALIASES,
+    CONCEPT_ALIASES,
+    FactKey,
+    fact_key,
+    select_anchor,
+    select_matching,
+    select_prior_year,
+)
 from backend.calc.ratios import RATIO_FUNCS, RatioInputError
 from backend.core.config import Settings
 from backend.core.llm import ClaudeClient, StructuredOutputError
 from backend.data.models import DataUnavailable, XBRLFact
 from backend.data.xbrl import XBRLClient, find_raw_entry
-from backend.evidence.errors import EvidenceNotFoundError
 from backend.evidence.models import Claim, ClaimBatch, Evidence
 from backend.evidence.store import EvidenceStore
 
 logger = logging.getLogger("agentinvest.agents.financial")
-
-# WHY an alias list per required input, here and not in backend/calc/: XBRL
-# tagging varies across filers (e.g. "Revenues" vs "SalesRevenueNet").
-# ratios.py stays agnostic to tagging conventions and only takes plain
-# floats; resolving "which concept means revenue for this filer" is this
-# agent's job. Known, documented gap: a filer using a tag outside this list
-# has that input simply skipped, not fabricated.
-_CONCEPT_ALIASES: Final[dict[str, tuple[str, ...]]] = {
-    "revenue": (
-        "Revenues",
-        "RevenueFromContractWithCustomerExcludingAssessedTax",
-        "SalesRevenueNet",
-    ),
-    "cogs": ("CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold"),
-    "net_income": ("NetIncomeLoss",),
-    "current_assets": ("AssetsCurrent",),
-    "current_liabilities": ("LiabilitiesCurrent",),
-}
-_ALL_ALIASES: Final[tuple[str, ...]] = tuple(
-    alias for aliases in _CONCEPT_ALIASES.values() for alias in aliases
-)
-
-# Tolerance for matching "the same point in the fiscal calendar, one year
-# earlier" when selecting a prior-year comparison fact for YoY growth.
-_PRIOR_YEAR_TOLERANCE_DAYS: Final[int] = 45
-
-FactKey = tuple[str, str, str, str | None]
-
-
-def _fact_key(fact: XBRLFact) -> FactKey:
-    return (
-        fact.concept,
-        fact.accession_number,
-        fact.period_end.isoformat(),
-        fact.period_start.isoformat() if fact.period_start else None,
-    )
-
-
-def _select_anchor(facts: list[XBRLFact], *, instant: bool) -> XBRLFact | None:
-    """Picks the most-recent (by period_end, then filed) fact of the given
-    shape (instant = balance-sheet-style point-in-time; duration = a
-    revenue/income-style figure over a period).
-
-    Known simplification: XBRL companyfacts contains many overlapping
-    periods (a 10-K's annual figure, a 10-Q's quarterly and
-    year-to-date cumulative figures for the same concept). "Most recent
-    period_end" is a reasonable, documented heuristic for a first version,
-    not a rigorous fiscal-period-aware selector.
-    """
-    candidates = [f for f in facts if (f.period_start is None) == instant]
-    if not candidates:
-        return None
-    return max(candidates, key=lambda f: (f.period_end, f.filed))
-
-
-def _select_matching(
-    facts: list[XBRLFact], aliases: tuple[str, ...], anchor: XBRLFact
-) -> XBRLFact | None:
-    """Finds a fact for one of `aliases` from the SAME accession and
-    period as `anchor` — so e.g. gross_margin's revenue and cogs come from
-    the same filing's same reporting period, not mismatched periods."""
-    for fact in facts:
-        if (
-            fact.concept in aliases
-            and fact.accession_number == anchor.accession_number
-            and fact.period_end == anchor.period_end
-            and fact.period_start == anchor.period_start
-        ):
-            return fact
-    return None
-
-
-def _select_prior_year(facts: list[XBRLFact], anchor: XBRLFact) -> XBRLFact | None:
-    """Finds a duration fact for the same concept whose period_end lands
-    close to one year before `anchor`'s, for YoY growth."""
-    candidates = [
-        fact
-        for fact in facts
-        if fact.period_start is not None and fact.period_end < anchor.period_end
-    ]
-    if not candidates:
-        return None
-    target = anchor.period_end - timedelta(days=365)
-    best = min(candidates, key=lambda f: abs((f.period_end - target).days))
-    if abs((best.period_end - target).days) > _PRIOR_YEAR_TOLERANCE_DAYS:
-        return None
-    return best
 
 
 def _format_evidence_line(evidence: Evidence) -> str:
@@ -132,19 +53,6 @@ def _format_evidence_line(evidence: Evidence) -> str:
         loc = evidence.location
         return f"- id={evidence.id} type=computed :: {loc['ratio_name']} = {loc['value']:.4f}"
     return f"- id={evidence.id} type={evidence.source_type} :: {evidence.quote[:120]}"
-
-
-def _validate_claim_batch(batch: ClaimBatch, store: EvidenceStore) -> None:
-    """`ClaudeClient.call_structured`'s `extra_validation` contract requires
-    raising `ValueError` to trigger its retry-with-feedback flow —
-    `EvidenceStore.resolve` raises `EvidenceNotFoundError` instead, so this
-    bridges the two.
-    """
-    for claim in batch.claims:
-        try:
-            store.resolve(claim.evidence_ids)
-        except EvidenceNotFoundError as exc:
-            raise ValueError(str(exc)) from exc
 
 
 class FinancialAgent:
@@ -164,7 +72,7 @@ class FinancialAgent:
         return "financial"
 
     async def run(self, ticker: str, as_of: date) -> list[Claim]:
-        result = await self._xbrl.get_company_facts_with_raw(ticker, as_of, concepts=_ALL_ALIASES)
+        result = await self._xbrl.get_company_facts_with_raw(ticker, as_of, concepts=ALL_ALIASES)
         if isinstance(result, DataUnavailable):
             # C6: missing data means no claims, never a crash and never a
             # fabricated number.
@@ -189,7 +97,7 @@ class FinancialAgent:
         fact_evidence: dict[FactKey, Evidence] = {}
 
         def ensure_fact_evidence(fact: XBRLFact) -> Evidence:
-            key = _fact_key(fact)
+            key = fact_key(fact)
             if key not in fact_evidence:
                 fact_evidence[key] = self._make_fact_evidence(fact, result.raw)
             return fact_evidence[key]
@@ -202,7 +110,7 @@ class FinancialAgent:
         if not self._store.all_evidence():
             return []
 
-        return self._emit_claims(ticker)
+        return await self._emit_claims(ticker)
 
     def _make_fact_evidence(self, fact: XBRLFact, raw: dict[str, object]) -> Evidence:
         entry = find_raw_entry(raw, fact)
@@ -234,13 +142,13 @@ class FinancialAgent:
     ) -> list[Evidence]:
         ratio_evidence: list[Evidence] = []
 
-        revenue_facts = [f for f in facts if f.concept in _CONCEPT_ALIASES["revenue"]]
-        anchor_revenue = _select_anchor(revenue_facts, instant=False)
+        revenue_facts = [f for f in facts if f.concept in CONCEPT_ALIASES["revenue"]]
+        anchor_revenue = select_anchor(revenue_facts, instant=False)
         if anchor_revenue is not None:
             # Ensure the bare revenue fact is citable even if no ratio
             # using it can be computed (e.g. cogs is missing).
             ensure_fact_evidence(anchor_revenue)
-            cogs = _select_matching(facts, _CONCEPT_ALIASES["cogs"], anchor_revenue)
+            cogs = select_matching(facts, CONCEPT_ALIASES["cogs"], anchor_revenue)
             if cogs is not None:
                 self._try_add_ratio(
                     ratio_evidence,
@@ -249,7 +157,7 @@ class FinancialAgent:
                     {"revenue": anchor_revenue, "cogs": cogs},
                     ensure_fact_evidence,
                 )
-            net_income = _select_matching(facts, _CONCEPT_ALIASES["net_income"], anchor_revenue)
+            net_income = select_matching(facts, CONCEPT_ALIASES["net_income"], anchor_revenue)
             if net_income is not None:
                 self._try_add_ratio(
                     ratio_evidence,
@@ -258,7 +166,7 @@ class FinancialAgent:
                     {"revenue": anchor_revenue, "net_income": net_income},
                     ensure_fact_evidence,
                 )
-            prior_revenue = _select_prior_year(revenue_facts, anchor_revenue)
+            prior_revenue = select_prior_year(revenue_facts, anchor_revenue)
             if prior_revenue is not None:
                 self._try_add_ratio(
                     ratio_evidence,
@@ -268,11 +176,11 @@ class FinancialAgent:
                     ensure_fact_evidence,
                 )
 
-        ca_facts = [f for f in facts if f.concept in _CONCEPT_ALIASES["current_assets"]]
-        anchor_ca = _select_anchor(ca_facts, instant=True)
+        ca_facts = [f for f in facts if f.concept in CONCEPT_ALIASES["current_assets"]]
+        anchor_ca = select_anchor(ca_facts, instant=True)
         if anchor_ca is not None:
             ensure_fact_evidence(anchor_ca)
-            cl = _select_matching(facts, _CONCEPT_ALIASES["current_liabilities"], anchor_ca)
+            cl = select_matching(facts, CONCEPT_ALIASES["current_liabilities"], anchor_ca)
             if cl is not None:
                 self._try_add_ratio(
                     ratio_evidence,
@@ -329,12 +237,20 @@ class FinancialAgent:
             )
         )
 
-    def _emit_claims(self, ticker: str) -> list[Claim]:
+    async def _emit_claims(self, ticker: str) -> list[Claim]:
         evidence_context = "\n".join(_format_evidence_line(ev) for ev in self._store.all_evidence())
         system_prompt = load_prompt("financial_agent_v1").format(evidence_context=evidence_context)
 
         try:
-            batch = self._claude.call_structured(
+            # WHY asyncio.to_thread: ClaudeClient.call_structured wraps the
+            # synchronous anthropic.Anthropic client, not AsyncAnthropic.
+            # Called directly, it would block the event loop for its full
+            # network latency — invisible with one agent, but under
+            # asyncio.gather (Phase 4's multiple concurrent agents) it
+            # would silently serialize every other agent's Claude call
+            # behind this one. See ADR-0019.
+            batch = await asyncio.to_thread(
+                self._claude.call_structured,
                 agent=self.agent_name,
                 model_cls=ClaimBatch,
                 messages=[
@@ -351,7 +267,7 @@ class FinancialAgent:
                     "Emit a batch of Claim objects for the evidence shown, "
                     "citing only the given evidence_ids."
                 ),
-                extra_validation=lambda batch: _validate_claim_batch(batch, self._store),
+                extra_validation=self._store.validate_claim_batch,
             )
         except StructuredOutputError as exc:
             self._store.record_dropped_claim(

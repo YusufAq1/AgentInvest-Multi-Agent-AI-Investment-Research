@@ -188,6 +188,31 @@ class Settings(BaseSettings):
     # than the final result size to have anything meaningful to fuse.
     rag_retrieval_candidate_k: int = 20
 
+    # Filings Agent (Phase 4)
+    filings_agent_model: str | None = None
+    filings_agent_max_tokens: int = 4096
+    # WHY 1, not configurable-yet-larger: matches scripts/rag_demo.py's
+    # exact, already-verified pattern — the single most recent 10-K. No
+    # Manager exists yet (Phase 5) to decide "which/how many filings
+    # actually matter for this ticker." A documented first-cut default,
+    # not a considered ceiling.
+    filings_agent_max_filings: int = 1
+
+    # News Agent (Phase 4)
+    news_agent_model: str | None = None
+    news_agent_max_tokens: int = 4096
+    # WHY duplicated here rather than reading NewsClient.get_8k_events's
+    # own lookback_days=365 default: CLAUDE.md §16 bans magic numbers
+    # outside core/config.py, and the News Agent — the caller deciding a
+    # research window — should own this choice, not NewsClient (a plain
+    # data-fetching client). NewsClient's own default stays as a
+    # library-level fallback for other callers that don't pass one.
+    news_agent_lookback_days: int = 365
+
+    # Competitive Agent (Phase 4)
+    competitive_agent_model: str | None = None
+    competitive_agent_max_tokens: int = 4096
+
     @property
     def postgres_dsn(self) -> str:
         """Single source of truth for the plain (sync-style) connection

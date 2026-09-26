@@ -18,10 +18,24 @@ import pytest
 from backend.db.models import Document, DocumentChunk
 from backend.rag import retrieval as retrieval_module
 from backend.rag.embeddings import EMBEDDING_DIM
-from backend.rag.retrieval import hybrid_search
+from backend.rag.retrieval import (
+    ChunkNotFoundError,
+    get_full_text_by_accession,
+    hybrid_search,
+    resolve_chunk_citation,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-TICKER = "AAPL"
+# WHY not "AAPL": scripts/rag_demo.py and evaluation/retrieval_eval.py both
+# write real, permanently-persisted chunks for real tickers (AAPL) into
+# the shared Supabase database used for these tests — outside any test
+# transaction, so per-test rollback never cleans them up. A synthetic,
+# never-real ticker keeps these tests' hybrid_search queries isolated to
+# only the rows each test seeds (confirmed: reusing "AAPL" here caused a
+# real failure once 110 real AAPL chunks existed alongside a test's 2
+# synthetic ones, diluting dense_rank in a way this test never intended
+# to measure).
+TICKER = "ZZTEST-RETRIEVAL"
 AS_OF = date(2024, 6, 30)
 
 
@@ -220,3 +234,61 @@ async def test_hybrid_search_never_returns_chunks_from_filings_after_as_of(
     )
 
     assert all(r.accession != "ACC-POST-AS-OF" for r in results)
+
+
+@pytest.mark.usefixtures("db_engine")
+async def test_resolve_chunk_citation_returns_offsets_and_verbatim_text(
+    db_session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    chunk_id = await _seed_chunk(
+        db_session,
+        accession="ACC-CITATION",
+        text="Citation-grade chunk text for offset verification.",
+        embedding=_unit_vector(0),
+    )
+
+    citation = await resolve_chunk_citation(chunk_id, session_factory=session_factory)
+
+    assert citation.chunk_id == chunk_id
+    assert citation.accession == "ACC-CITATION"
+    assert citation.item == "1A"
+    assert citation.char_start == 0
+    assert citation.char_end == len("Citation-grade chunk text for offset verification.")
+    assert citation.text == "Citation-grade chunk text for offset verification."
+
+
+@pytest.mark.usefixtures("db_engine")
+async def test_resolve_chunk_citation_raises_for_unknown_chunk_id(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    with pytest.raises(ChunkNotFoundError):
+        await resolve_chunk_citation(uuid4(), session_factory=session_factory)
+
+
+@pytest.mark.usefixtures("db_engine")
+async def test_get_full_text_by_accession_returns_stored_text(
+    db_session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await _seed_chunk(
+        db_session,
+        accession="ACC-FULLTEXT",
+        text="The complete stored document text.",
+        embedding=_unit_vector(0),
+    )
+
+    full_text = await get_full_text_by_accession("ACC-FULLTEXT", session_factory=session_factory)
+
+    assert full_text == "The complete stored document text."
+
+
+@pytest.mark.usefixtures("db_engine")
+async def test_get_full_text_by_accession_returns_none_when_missing(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    full_text = await get_full_text_by_accession(
+        "ACC-DOES-NOT-EXIST", session_factory=session_factory
+    )
+
+    assert full_text is None
