@@ -37,18 +37,25 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from backend.agents.competitive import CompetitiveAgent
 from backend.agents.filings import FilingsAgent
 from backend.agents.financial import FinancialAgent
+from backend.agents.manager import ResearchManager
 from backend.agents.news import NewsAgent
 from backend.agents.peer_map import PEER_MAP
+from backend.agents.valuation import ValuationAgent
+from backend.agents.valuation_inputs import ValuationInputAssembler
 from backend.core.config import Settings
 from backend.core.llm import AgentInvestError, ClaudeClient, LLMCallResult, total_cost
 from backend.data.cache import Cache
 from backend.data.cik import CikResolver
+from backend.data.company import CompanyClient
 from backend.data.edgar import EdgarClient
 from backend.data.http import SecHttpClient
+from backend.data.macro import MacroClient
 from backend.data.news import NewsClient
+from backend.data.prices import PricesClient
 from backend.data.xbrl import XBRLClient
 from backend.db.session import make_engine, make_session_factory
 from backend.orchestration.graph import AgentContext, AgentFactory, RunDependencies
+from backend.orchestration.planning import Planner
 from backend.orchestration.state import (
     CHECKPOINT_TYPES,
     AgentName,
@@ -116,6 +123,7 @@ def _default_agent_factories(
     edgar: EdgarClient,
     session_factory: async_sessionmaker[AsyncSession],
     peer_map: dict[str, tuple[str, ...]],
+    valuation_assembler: ValuationInputAssembler,
 ) -> dict[AgentName, AgentFactory]:
     """How each real agent is built for one run.
 
@@ -141,11 +149,15 @@ def _default_agent_factories(
     def competitive(ctx: AgentContext) -> CompetitiveAgent:
         return CompetitiveAgent(xbrl, ctx.claude, ctx.store, ctx.settings, peer_map=peer_map)
 
+    def valuation(ctx: AgentContext) -> ValuationAgent:
+        return ValuationAgent(valuation_assembler, ctx.claude, ctx.store, ctx.settings)
+
     return {
         "financial": financial,
         "filings": filings,
         "news": news_agent,
         "competitive": competitive,
+        "valuation": valuation,
     }
 
 
@@ -171,12 +183,18 @@ async def open_run_dependencies(settings: Settings) -> AsyncIterator[RunDependen
     cik = CikResolver(http, cache)
     xbrl = XBRLClient(http, cik, cache)
     news = NewsClient(http, cik, cache)
+    company = CompanyClient(http, cik, cache)
+    macro = MacroClient(settings, cache)
+    valuation_assembler = ValuationInputAssembler(xbrl, PricesClient(settings), macro, settings)
     edgar = EdgarClient(settings)
     engine = make_engine(settings)
     session_factory = make_session_factory(engine)
 
     def claude_factory(on_result: Callable[[LLMCallResult], None]) -> ClaudeClient:
         return ClaudeClient(settings, on_result=on_result)
+
+    def planner_factory(claude: ClaudeClient) -> Planner:
+        return ResearchManager(company, claude, settings, PEER_MAP)
 
     try:
         yield RunDependencies(
@@ -187,12 +205,14 @@ async def open_run_dependencies(settings: Settings) -> AsyncIterator[RunDependen
                 edgar=edgar,
                 session_factory=session_factory,
                 peer_map=PEER_MAP,
+                valuation_assembler=valuation_assembler,
             ),
             claude_factory=claude_factory,
-            peer_map=PEER_MAP,
+            planner_factory=planner_factory,
         )
     finally:
         await http.aclose()
+        await macro.aclose()
         await engine.dispose()
 
 

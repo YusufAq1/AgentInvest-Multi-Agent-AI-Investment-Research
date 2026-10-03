@@ -28,7 +28,7 @@ from backend.core.llm import (
 )
 from pydantic import BaseModel
 
-from tests.conftest import make_settings
+from tests.conftest import assert_sdk_accepts_every_call, make_settings
 
 PRICING = ModelPricing(
     input_per_mtok=Decimal("1.00"),
@@ -361,3 +361,35 @@ def test_total_cost_sums_hand_worked_values() -> None:
 
     assert total_cost([]) == Decimal("0")
     assert total_cost([_result("0.001250"), _result("0.000500")]) == Decimal("0.001750")
+
+
+def test_every_request_is_accepted_by_the_real_sdk_signature() -> None:
+    """Contract test: the kwargs _call_raw builds, with every optional part
+    present (system, tools, forced tool_choice, and a retry), must bind to
+    the installed SDK's real `Messages.create` signature."""
+    settings = make_settings()
+    mock_sdk_client = MagicMock()
+    bad = _fake_tool_response({"x": 1}, tool_use_id="toolu_bad")
+    good = _fake_tool_response({"x": 1, "y": 2})
+    mock_sdk_client.messages.create.side_effect = [bad, good]
+    client = ClaudeClient(settings, client=mock_sdk_client)
+
+    client.call_structured(
+        agent="test_agent",
+        model_cls=_Point,
+        messages=[{"role": "user", "content": "go"}],
+        system="system prompt",
+        tool_name="emit_point",
+        tool_description="emit a point",
+    )
+
+    assert_sdk_accepts_every_call(mock_sdk_client)
+
+
+def test_the_contract_check_rejects_an_unknown_keyword() -> None:
+    """Guards the guard: the check really does fail on a keyword the SDK
+    doesn't have, which is the bug it was written for."""
+    mock_sdk_client = MagicMock()
+    mock_sdk_client.messages.create(model="m", max_tokens=1, messages=[], temperature=0.0)
+    with pytest.raises(TypeError):
+        assert_sdk_accepts_every_call(mock_sdk_client)

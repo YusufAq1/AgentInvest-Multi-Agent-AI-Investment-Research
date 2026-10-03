@@ -203,3 +203,115 @@ def test_validate_all_evidence_empty_when_all_valid() -> None:
     failures = validate_all_evidence([good], xbrl_raw_payloads={"acc-1": _RAW_PAYLOAD})
 
     assert failures == []
+
+
+# ---- Phase 6: linear combinations, declared constants, market data ----
+
+
+def _value_row(source_type: str, value: float) -> Evidence:
+    return _make_evidence(source_type=source_type, location={"value": value})
+
+
+def test_computed_input_can_be_a_signed_combination_of_cited_rows() -> None:
+    """net_debt(total_debt = 400 + 50, cash = 150 + 50) = 450 − 200 = 250."""
+    ltd, cp, cash, sec = (_value_row("xbrl_fact", v) for v in (400, 50, 150, 50))
+    row = _make_evidence(
+        source_type="computed",
+        location={
+            "ratio_name": "net_debt",
+            "input_evidence_ids": {
+                "total_debt": [[1.0, str(ltd.id)], [1.0, str(cp.id)]],
+                "cash": [[1.0, str(cash.id)], [1.0, str(sec.id)]],
+            },
+            "value": 250.0,
+        },
+    )
+    validate_citation(row, resolve=_resolver_for({str(e.id): e for e in (ltd, cp, cash, sec)}))
+
+
+def test_undeclared_constant_inputs_are_rejected() -> None:
+    """net_debt allows no constants, so a row can't self-report its cash."""
+    ltd = _value_row("xbrl_fact", 400)
+    row = _make_evidence(
+        source_type="computed",
+        location={
+            "ratio_name": "net_debt",
+            "input_evidence_ids": {"total_debt": str(ltd.id)},
+            "constant_inputs": {"cash": 100.0},
+            "value": 300.0,
+        },
+    )
+    with pytest.raises(CitationInvalidError, match="constants"):
+        validate_citation(row, resolve=_resolver_for({str(ltd.id): ltd}))
+
+
+def test_valuation_rows_may_chain_but_ratios_may_not() -> None:
+    """cost_of_equity may cite macro and price rows; ERP is a declared
+    constant. 0.04 + 1.2 × 0.05 = 0.10."""
+    rf, beta = _value_row("macro", 0.04), _value_row("price_series", 1.2)
+    row = _make_evidence(
+        source_type="computed",
+        location={
+            "ratio_name": "cost_of_equity",
+            "input_evidence_ids": {"risk_free_rate": str(rf.id), "beta": str(beta.id)},
+            "constant_inputs": {"equity_risk_premium": 0.05},
+            "value": 0.10,
+        },
+    )
+    validate_citation(row, resolve=_resolver_for({str(rf.id): rf, str(beta.id): beta}))
+
+
+def _market_row(location: dict[str, Any]) -> Evidence:
+    from backend.evidence.market_quotes import render_market_quote
+
+    return _make_evidence(
+        source_type="price_series", quote=render_market_quote(location), location=location
+    )
+
+
+_BETA = {
+    "kind": "beta",
+    "ticker": "TICK",
+    "market": "SPY",
+    "observations": 60.0,
+    "as_of": "2024-06-30",
+    "value": 1.5,
+    "covariance": 0.0006,
+    "market_variance": 0.0004,
+}
+
+
+def test_market_datum_with_canonical_quote_passes() -> None:
+    validate_citation(_market_row(_BETA))
+
+
+def test_market_datum_whose_value_was_edited_fails() -> None:
+    row = _market_row(_BETA)
+    edited = row.model_copy(update={"location": {**_BETA, "value": 2.0}})
+    with pytest.raises(CitationInvalidError, match="canonical"):
+        validate_citation(edited)
+
+
+def test_beta_inconsistent_with_its_moments_fails() -> None:
+    with pytest.raises(CitationInvalidError, match="covariance"):
+        validate_citation(_market_row({**_BETA, "value": 1.7}))
+
+
+def test_risk_free_decimal_must_match_its_percent() -> None:
+    location = {
+        "kind": "risk_free_rate",
+        "series_id": "DGS10",
+        "date": "2024-06-27",
+        "as_of": "2024-06-30",
+        "percent": 4.29,
+        "value": 0.0429,
+    }
+    validate_citation(_market_row(location))
+    with pytest.raises(CitationInvalidError, match="percent"):
+        validate_citation(_market_row({**location, "value": 0.05}))
+
+
+def test_market_datum_of_unknown_kind_fails() -> None:
+    row = _make_evidence(source_type="macro", quote="x", location={"kind": "mystery"})
+    with pytest.raises(CitationInvalidError):
+        validate_citation(row)

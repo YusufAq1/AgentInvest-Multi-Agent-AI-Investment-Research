@@ -36,12 +36,18 @@ from pydantic import BaseModel, Field, model_validator
 from backend.core.llm import LLMCallResult
 from backend.evidence.models import Claim, DroppedClaim, Evidence
 
-AgentName = Literal["financial", "filings", "news", "competitive"]
+AgentName = Literal["financial", "filings", "news", "competitive", "valuation"]
 
 # WHY an explicit tuple alongside the Literal: the graph needs to iterate
 # over every possible agent node at build time (one node per name), and a
 # Literal can't be iterated without typing.get_args reflection.
-ALL_AGENTS: Final[tuple[AgentName, ...]] = ("financial", "filings", "news", "competitive")
+ALL_AGENTS: Final[tuple[AgentName, ...]] = (
+    "financial",
+    "filings",
+    "news",
+    "competitive",
+    "valuation",
+)
 
 
 class AgentRoute(BaseModel):
@@ -63,16 +69,20 @@ class SkippedAgent(BaseModel):
 class ResearchPlan(BaseModel):
     """What the run will research.
 
-    `source` says who made the plan. Increment 5a only produces
-    "deterministic" plans (backend/orchestration/planning.py); Increment 5b
-    adds "llm" (the Research Manager) and "fallback" (the deterministic
-    plan, used because the Manager failed — recorded, never silent).
+    `source` says who made the plan:
+      - "llm": the Research Manager (backend/agents/manager.py)
+      - "deterministic": planning.py's rule-based plan, used when a run is
+        configured without the Manager (tests, or by choice)
+      - "fallback": the deterministic plan, used because the Manager
+        failed. `fallback_reason` says why. It's recorded and surfaced,
+        never silent.
     """
 
-    source: Literal["deterministic"]
+    source: Literal["llm", "deterministic", "fallback"]
     routes: list[AgentRoute]
     skipped: list[SkippedAgent]
     filings_questions: list[str] = Field(default_factory=list)
+    fallback_reason: str | None = None
 
     @model_validator(mode="after")
     def _routes_and_skips_are_disjoint(self) -> ResearchPlan:
@@ -82,6 +92,8 @@ class ResearchPlan(BaseModel):
             raise ValueError(f"Duplicate agent routes: {routed}")
         if set(routed) & set(skipped):
             raise ValueError(f"Agents both routed and skipped: {set(routed) & set(skipped)}")
+        if (self.source == "fallback") != (self.fallback_reason is not None):
+            raise ValueError("fallback_reason is required for, and only for, a fallback plan")
         return self
 
     def routed_agents(self) -> list[AgentName]:

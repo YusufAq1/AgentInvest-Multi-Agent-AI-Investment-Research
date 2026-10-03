@@ -22,20 +22,25 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
+from backend.agents.manager import ResearchManager
 from backend.core.llm import ClaudeClient, LLMCallResult, total_cost
+from backend.data.company import CompanyClient
+from backend.data.models import CompanyProfile
 from backend.evidence.errors import EvidenceNotFoundError, LookAheadEvidenceError
 from backend.evidence.models import Claim, Evidence
 from backend.orchestration.graph import (
     AgentContext,
     AgentFactory,
+    PlannerFactory,
     RunDependencies,
     _collect_node,
     build_research_graph,
 )
+from backend.orchestration.planning import DeterministicPlanner
 from backend.orchestration.runner import (
     ResearchGraph,
     RunNotFoundError,
@@ -65,20 +70,36 @@ class _Interrupted(BaseException):
     KeyboardInterrupt would."""
 
 
-def _mock_sdk(input_tokens: int = 1000) -> MagicMock:
+def _mock_sdk(
+    input_tokens: int = 1000, plan_inputs: list[dict[str, Any]] | None = None
+) -> MagicMock:
     """An Anthropic SDK stand-in: every call bills `input_tokens` Haiku
-    input tokens ($1/Mtok → 0.001 USD per call at the default 1000)."""
-    sdk = MagicMock()
-    sdk.messages.create.return_value = SimpleNamespace(
-        content=[SimpleNamespace(type="text", text="ok")],
-        usage=SimpleNamespace(
-            input_tokens=input_tokens,
-            output_tokens=0,
-            cache_creation_input_tokens=0,
-            cache_read_input_tokens=0,
-        ),
-        stop_reason="end_turn",
+    input tokens ($1/Mtok → 0.001 USD per call at the default 1000).
+
+    A forced tool call (the Research Manager's) is answered with the next
+    entry of `plan_inputs` as the tool input; anything else gets text."""
+    remaining_plans = list(plan_inputs or [])
+    usage = SimpleNamespace(
+        input_tokens=input_tokens,
+        output_tokens=0,
+        cache_creation_input_tokens=0,
+        cache_read_input_tokens=0,
     )
+
+    def respond(**kwargs: Any) -> SimpleNamespace:
+        if "tool_choice" in kwargs:
+            block = SimpleNamespace(
+                type="tool_use",
+                id="toolu_plan",
+                name=kwargs["tool_choice"]["name"],
+                input=remaining_plans.pop(0),
+            )
+            return SimpleNamespace(content=[block], usage=usage, stop_reason="tool_use")
+        text = SimpleNamespace(type="text", text="ok")
+        return SimpleNamespace(content=[text], usage=usage, stop_reason="end_turn")
+
+    sdk = MagicMock()
+    sdk.messages.create.side_effect = respond
     return sdk
 
 
@@ -133,11 +154,15 @@ def _deps(
     failures: dict[AgentName, BaseException | Callable[[], BaseException | None]] | None = None,
     peer_map: dict[str, tuple[str, ...]] = PEER_MAP,
     built: Counter[str] | None = None,
+    planner_factory: PlannerFactory | None = None,
+    plan_inputs: list[dict[str, Any]] | None = None,
 ) -> RunDependencies:
     """Fake dependencies. `failures[name]` is either an exception to raise,
     or a zero-arg callable returning one (or None) per construction, so
     the resume test can fail an agent the first time only. `built` counts
-    how many times each agent was constructed."""
+    how many times each agent was constructed. The planner defaults to the
+    deterministic one; tests of the Research Manager inside the graph pass
+    their own `planner_factory`."""
     failures = failures or {}
     settings = make_settings()
 
@@ -153,13 +178,17 @@ def _deps(
         return build
 
     def claude_factory(on_result: Callable[[LLMCallResult], None]) -> ClaudeClient:
-        return ClaudeClient(settings, client=_mock_sdk(), on_result=on_result)
+        # WHY copy per client: each node builds its own client, and only the
+        # planner's (the one making a forced tool call) consumes a plan.
+        return ClaudeClient(
+            settings, client=_mock_sdk(plan_inputs=plan_inputs), on_result=on_result
+        )
 
     return RunDependencies(
         settings=settings,
         agent_factories={name: factory_for(name) for name in ALL_AGENTS},
         claude_factory=claude_factory,
-        peer_map=peer_map,
+        planner_factory=planner_factory or (lambda _claude: DeterministicPlanner(peer_map)),
     )
 
 
@@ -187,7 +216,7 @@ async def test_run_cost_is_collected_per_call_and_summed() -> None:
 
     # One mocked call per agent, 1000 Haiku input tokens each = $0.001.
     assert Counter(c.agent for c in result.state["llm_calls"]) == dict.fromkeys(ALL_AGENTS, 1)
-    assert result.total_cost_usd == Decimal("0.004")
+    assert result.total_cost_usd == Decimal("0.001") * len(ALL_AGENTS)
     assert result.total_cost_usd == total_cost(result.state["llm_calls"])
 
 
@@ -229,8 +258,8 @@ async def test_progress_events_are_streamed_in_order() -> None:
     assert kinds[-1] == "run_collected"
     assert Counter(kinds) == {
         "plan_ready": 1,
-        "agent_started": 4,
-        "agent_finished": 4,
+        "agent_started": len(ALL_AGENTS),
+        "agent_finished": len(ALL_AGENTS),
         "run_collected": 1,
     }
     # Every agent starts before any finishes: the fan-out is one superstep.
@@ -321,7 +350,7 @@ async def test_interrupted_run_resumes_without_rerunning_finished_agents() -> No
     assert {o.agent: o.status for o in result.outcomes} == dict.fromkeys(ALL_AGENTS, "succeeded")
     # The three agents that finished before the interruption were not
     # rebuilt or rerun: their state updates came from the checkpoint.
-    assert built == {"financial": 1, "filings": 1, "competitive": 1, "news": 2}
+    assert built == {"financial": 1, "filings": 1, "competitive": 1, "valuation": 1, "news": 2}
     # Each finished agent's cost is counted exactly once. The interrupted
     # attempt's news call was never checkpointed (the node didn't return),
     # so it's missing here. See ADR-0001 on this known under-count.
@@ -356,3 +385,58 @@ def test_serializer_does_not_rebuild_types_outside_the_allowlist() -> None:
     serde = make_serializer()
     restored = serde.loads_typed(serde.dumps_typed(NotAllowlisted(agent="news", status="failed")))
     assert not isinstance(restored, NotAllowlisted)
+
+
+def _manager_factory(peer_map: dict[str, tuple[str, ...]]) -> PlannerFactory:
+    company = MagicMock(spec=CompanyClient)
+    company.get_company_profile = AsyncMock(
+        return_value=CompanyProfile(
+            ticker=TICKER, cik="0000000001", name="Tick Corp", sic=None, sic_description=None
+        )
+    )
+    return lambda claude: ResearchManager(company, claude, make_settings(), peer_map)
+
+
+async def test_research_manager_can_skip_an_agent_and_its_cost_is_counted() -> None:
+    plan_input = {
+        "routes": [
+            {"agent": "financial", "rationale": "fundamentals"},
+            {"agent": "filings", "rationale": "10-K"},
+            {"agent": "competitive", "rationale": "peers exist"},
+            {"agent": "valuation", "rationale": "has a share price"},
+        ],
+        "skipped": [{"agent": "news", "reason": "no material events expected to matter"}],
+        "filings_questions": ["Question one?", "Question two?", "Question three?"],
+    }
+    built: Counter[str] = Counter()
+    deps = _deps(built=built, planner_factory=_manager_factory(PEER_MAP), plan_inputs=[plan_input])
+
+    result = await start_run(_graph(deps), run_id=uuid4(), ticker=TICKER, as_of=AS_OF)
+
+    assert result.plan is not None and result.plan.source == "llm"
+    assert result.plan.filings_questions == plan_input["filings_questions"]
+    news = next(o for o in result.outcomes if o.agent == "news")
+    assert news.status == "skipped"
+    assert news.detail == "no material events expected to matter"
+    assert built["news"] == 0
+    # The planner's own Claude call is part of the run's cost.
+    assert Counter(c.agent for c in result.state["llm_calls"])["manager"] == 1
+
+
+async def test_manager_fallback_is_streamed_and_the_run_still_completes() -> None:
+    invalid: dict[str, Any] = {"routes": [], "skipped": [], "filings_questions": []}
+    events: list[dict[str, Any]] = []
+    deps = _deps(planner_factory=_manager_factory(PEER_MAP), plan_inputs=[invalid, invalid])
+
+    result = await start_run(
+        _graph(deps), run_id=uuid4(), ticker=TICKER, as_of=AS_OF, on_event=events.append
+    )
+
+    assert result.completed
+    assert result.plan is not None and result.plan.source == "fallback"
+    plan_event = next(e for e in events if e["event"] == "plan_ready")
+    assert plan_event["source"] == "fallback"
+    assert "StructuredOutputError" in plan_event["fallback_reason"]
+    assert {o.agent: o.status for o in result.outcomes} == dict.fromkeys(ALL_AGENTS, "succeeded")
+    # Both failed planning attempts were paid for, so both are counted.
+    assert Counter(c.agent for c in result.state["llm_calls"])["manager"] == 2

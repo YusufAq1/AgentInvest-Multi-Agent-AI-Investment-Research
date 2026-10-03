@@ -12,7 +12,13 @@ something different for prose than for a derived number:
     not a trick).
   - computed: no containment check at all (a ratio never existed verbatim
     in any upstream document) — instead, recompute the value from its
-    cited input evidence and assert it matches.
+    cited input evidence and assert it matches. Since Phase 6 an input may
+    be a signed linear combination of cited rows (a 3-year capex sum, a
+    revenue change, shares × split factor), and valuation numbers may cite
+    market, macro and other computed rows (backend/calc/registry.py).
+  - price_series / macro: no archived source document exists, so the quote
+    must equal the canonical rendering of the row's own fields, plus
+    internal consistency checks (backend/evidence/market_quotes.py).
 
 Deliberately run at CI/test time, not inline in an agent's hot path: in
 Phase 2, Claude never produces a quote (it only cites evidence_ids Python
@@ -30,8 +36,10 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
-from backend.calc.ratios import RATIO_FUNCS
+from backend.calc.ratios import RatioInputError
+from backend.calc.registry import COMPUTED_FUNCS
 from backend.evidence.errors import CitationInvalidError, CitationValidationSetupError
+from backend.evidence.market_quotes import UnknownMarketDatumError, render_market_quote
 from backend.evidence.models import Evidence
 
 Resolver = Callable[[Sequence[UUID]], list[Evidence]]
@@ -70,6 +78,8 @@ def validate_citation(
         _validate_xbrl_fact(evidence, xbrl_raw_payload=xbrl_raw_payload)
     elif evidence.source_type == "computed":
         _validate_computed(evidence, resolve=resolve)
+    elif evidence.source_type in ("price_series", "macro"):
+        _validate_market_datum(evidence)
     else:
         raise CitationValidationSetupError(
             f"validate_citation has no check implemented yet for "
@@ -119,6 +129,15 @@ def _validate_computed(evidence: Evidence, *, resolve: Resolver | None) -> None:
     duplicated-inputs design would let a bug (or a compromised agent)
     fabricate `inputs` and `value` together with nothing to cross-check
     them against real stored facts.
+
+    `location["input_evidence_ids"]` maps each parameter to either one
+    evidence id, or a list of `[coefficient, evidence_id]` pairs whose
+    resolved values are combined as Σ coefficient × value (a sum, a
+    difference, a split-scaled share count). The ONLY inputs not resolved
+    from evidence are `location["constant_inputs"]`, and each one must be
+    declared as an allowed constant for that calculation in
+    backend/calc/registry.py (configured assumptions like the ERP), so a
+    row can't self-report anything else.
     """
     if resolve is None:
         raise CitationValidationSetupError(
@@ -128,33 +147,81 @@ def _validate_computed(evidence: Evidence, *, resolve: Resolver | None) -> None:
     location = evidence.location
     try:
         ratio_name: str = location["ratio_name"]
-        input_ids_by_param: dict[str, str] = location["input_evidence_ids"]
+        input_ids_by_param: dict[str, Any] = location["input_evidence_ids"]
         expected_value: float = location["value"]
     except KeyError as exc:
         raise CitationInvalidError(
             f"evidence {evidence.id}: computed evidence missing required location field {exc}"
         ) from None
+    constants: dict[str, float] = location.get("constant_inputs", {})
 
-    ratio_func = RATIO_FUNCS.get(ratio_name)
-    if ratio_func is None:
+    spec = COMPUTED_FUNCS.get(ratio_name)
+    if spec is None:
         raise CitationInvalidError(f"evidence {evidence.id}: unknown ratio_name {ratio_name!r}")
 
-    inputs: dict[str, float] = {}
-    for param, id_str in input_ids_by_param.items():
-        (source,) = resolve([UUID(id_str)])
-        if source.source_type != "xbrl_fact":
-            raise CitationInvalidError(
-                f"evidence {evidence.id}: computed evidence cites non-xbrl_fact "
-                f"input {source.id} (source_type={source.source_type!r})"
-            )
-        inputs[param] = source.location["value"]
+    undeclared = set(constants) - spec.allowed_constants
+    if undeclared:
+        raise CitationInvalidError(
+            f"evidence {evidence.id}: {ratio_name} may not take {sorted(undeclared)} as "
+            "constants; they must be cited evidence"
+        )
 
-    result = ratio_func(**inputs)
-    if not math.isclose(result.value, expected_value, rel_tol=1e-9):
+    def resolved_value(id_str: str) -> float:
+        (source,) = resolve([UUID(id_str)])
+        if source.source_type not in spec.allowed_input_types:
+            raise CitationInvalidError(
+                f"evidence {evidence.id}: {ratio_name} cites input {source.id} with "
+                f"source_type={source.source_type!r}, allowed: {sorted(spec.allowed_input_types)}"
+            )
+        value: float = source.location["value"]
+        return value
+
+    inputs: dict[str, float] = dict(constants)
+    for param, reference in input_ids_by_param.items():
+        if isinstance(reference, str):
+            inputs[param] = resolved_value(reference)
+        else:
+            inputs[param] = sum(
+                float(coefficient) * resolved_value(id_str) for coefficient, id_str in reference
+            )
+
+    try:
+        result = spec.func(**inputs)
+    except (RatioInputError, TypeError) as exc:
+        raise CitationInvalidError(
+            f"evidence {evidence.id}: recomputing {ratio_name} failed: {exc}"
+        ) from exc
+    if not math.isclose(result.value, expected_value, rel_tol=1e-9, abs_tol=1e-12):
         raise CitationInvalidError(
             f"evidence {evidence.id}: recomputed {ratio_name}={result.value} "
             f"does not match stored value={expected_value}"
         )
+
+
+def _validate_market_datum(evidence: Evidence) -> None:
+    """The quote must be the canonical rendering of the row's own fields,
+    and the fields must be internally consistent. See market_quotes.py for
+    what this does and doesn't prove."""
+    location = evidence.location
+    try:
+        canonical = render_market_quote(location)
+    except (UnknownMarketDatumError, KeyError) as exc:
+        raise CitationInvalidError(
+            f"evidence {evidence.id}: no canonical quote for this market datum ({exc})"
+        ) from None
+    if evidence.quote != canonical:
+        raise CitationInvalidError(
+            f"evidence {evidence.id}: quote does not match the canonical rendering of its value"
+        )
+    kind = location["kind"]
+    if kind == "beta" and not math.isclose(
+        location["value"], location["covariance"] / location["market_variance"], rel_tol=1e-9
+    ):
+        raise CitationInvalidError(f"evidence {evidence.id}: beta != covariance / variance")
+    if kind == "risk_free_rate" and not math.isclose(
+        location["value"], location["percent"] / 100, rel_tol=1e-12
+    ):
+        raise CitationInvalidError(f"evidence {evidence.id}: decimal rate != percent / 100")
 
 
 def validate_all_evidence(

@@ -1,8 +1,8 @@
 """Financial ratios computed from XBRL facts. Pure functions, no LLM.
 
-Four ratios, one from each category CLAUDE.md §7 assigns to Python:
+Five ratios from the categories CLAUDE.md §7 assigns to Python:
 profitability (gross_margin, net_margin), liquidity (current_ratio), and
-growth (yoy_revenue_growth). Each takes plain floats and is agnostic to
+growth (yoy_revenue_growth, revenue_cagr). Each takes plain floats and is agnostic to
 XBRL tagging conventions — resolving "which XBRL concept means revenue for
 this filer" is the Financial Agent's job (concept names vary across
 filers), not this module's.
@@ -91,6 +91,30 @@ def yoy_revenue_growth(*, revenue_current: float, revenue_prior: float) -> Ratio
     )
 
 
+def revenue_cagr(*, revenue_start: float, revenue_end: float, years: float) -> RatioResult:
+    """(revenue_end / revenue_start) ** (1 / years) - 1.
+
+    Compound annual growth rate: the constant yearly rate that turns
+    revenue_start into revenue_end over `years`. It's the history the
+    reverse DCF's implied growth is judged against (CLAUDE.md §8).
+    Raises for a non-positive start or end revenue (the ratio would be
+    undefined or complex) or a non-positive number of years.
+    """
+    if revenue_start <= 0 or revenue_end <= 0:
+        raise RatioInputError(
+            f"revenue_cagr: revenues must be positive, got {revenue_start} and {revenue_end}"
+        )
+    if years <= 0:
+        raise RatioInputError(f"revenue_cagr: years must be positive, got {years}")
+    value = (revenue_end / revenue_start) ** (1 / years) - 1
+    return RatioResult(
+        name="revenue_cagr",
+        formula="(revenue_end / revenue_start) ** (1 / years) - 1",
+        inputs={"revenue_start": revenue_start, "revenue_end": revenue_end, "years": years},
+        value=value,
+    )
+
+
 # WHY one dispatch table, not scattered `if ratio_name == ...` chains: both
 # the Financial Agent (to compute) and validation.py (to recompute during
 # citation-validity checks) need "look up a ratio function by name" — one
@@ -100,4 +124,5 @@ RATIO_FUNCS: Final[dict[str, Callable[..., RatioResult]]] = {
     "net_margin": net_margin,
     "current_ratio": current_ratio,
     "yoy_revenue_growth": yoy_revenue_growth,
+    "revenue_cagr": revenue_cagr,
 }

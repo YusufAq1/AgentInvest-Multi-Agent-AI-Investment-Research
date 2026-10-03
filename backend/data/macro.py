@@ -85,6 +85,7 @@ class MacroClient:
             "series_id": series_id,
             "observation_start": observation_start.isoformat(),
             "observation_end": as_of.isoformat(),
+            "realtime_start": as_of.isoformat(),
             "realtime_end": as_of.isoformat(),
         }
         cached = await self._cache.get(source=_CACHE_SOURCE, args=args, as_of=as_of)
@@ -113,7 +114,16 @@ class MacroClient:
             # excludes values *revised* after as_of for an in-range period
             # (e.g. a GDP print revised months after first release). Using
             # only one is insufficient.
+            #
+            # WHY realtime_start = as_of too (fixed in Phase 6): sending only
+            # realtime_end makes FRED default realtime_start to 1776-07-04,
+            # which for a daily series like DGS10 spans thousands of
+            # vintages and FRED rejects it with 400 ("4562 vintage dates ...
+            # exceeds the maximum ... (2000)"). Pinning both ends to as_of
+            # asks for exactly one vintage, "the data as it was known on
+            # as_of", which is the point-in-time question in the first place.
             "observation_end": as_of.isoformat(),
+            "realtime_start": as_of.isoformat(),
             "realtime_end": as_of.isoformat(),
         }
         try:

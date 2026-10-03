@@ -32,6 +32,9 @@ async def test_get_series_requests_both_observation_and_realtime_end(tmp_path: P
     request_params = dict(route.calls.last.request.url.params)
     assert request_params["observation_end"] == "2024-06-30"
     assert request_params["realtime_end"] == "2024-06-30"
+    # Without realtime_start FRED defaults it to 1776 and rejects daily
+    # series (too many vintages); both ends pin the as_of vintage.
+    assert request_params["realtime_start"] == "2024-06-30"
     assert request_params["series_id"] == "DGS10"
     await client.aclose()
 

@@ -213,6 +213,76 @@ class Settings(BaseSettings):
     competitive_agent_model: str | None = None
     competitive_agent_max_tokens: int = 4096
 
+    # Research Manager (Phase 5, Increment 5b)
+    manager_agent_model: str | None = None
+    # WHY 2048: a plan is small (≤5 routes/skips + ≤8 short questions).
+    # This leaves headroom without inviting an essay.
+    manager_agent_max_tokens: int = 2048
+    # WHY 3-8: fewer than 3 questions under-samples a 10-K. More than 8
+    # multiplies hybrid-search round trips and the evidence the Filings
+    # Agent sends to Claude, which means cost. The deterministic plan uses 5.
+    manager_min_filings_questions: int = 3
+    manager_max_filings_questions: int = 8
+
+    # Valuation (Phase 6). Every assumption here is printed with each
+    # valuation, so none of them is a hidden input (CLAUDE.md §8).
+    # WHY 10 years: the conventional explicit horizon for a reverse DCF. It's
+    # long enough that "growth for N years" is a meaningful claim, and short
+    # enough that the perpetuity terminal value isn't the whole answer.
+    valuation_horizon_years: int = 10
+    # WHY 5.0%: CLAUDE.md §8 sets a 4.5-5.5% range for the equity risk
+    # premium; this is its midpoint. It's a configured constant, not
+    # estimated, and printed as such.
+    valuation_equity_risk_premium: float = 0.05
+    # WHY 21%: the US federal statutory rate. §8 allows it when effective
+    # rates are noisy, and effective rates swing on one-offs.
+    valuation_tax_rate: float = 0.21
+    # WHY SPY over 5 years of monthly returns, needing 36 months: the most
+    # common beta convention (about 60 observations), with a floor below
+    # which a beta is too noisy to use.
+    valuation_beta_market_ticker: str = "SPY"
+    valuation_beta_lookback_years: int = 5
+    valuation_beta_min_observations: int = 36
+    # WHY -30%..+60% in 0.5% steps: wide enough for real companies (a
+    # target outside it returns "no implied growth" with the reason,
+    # never a clipped number), and fine enough that bisection starts from
+    # a tight bracket. 1e-7 is far below any meaningful growth difference.
+    valuation_growth_search_min: float = -0.30
+    valuation_growth_search_max: float = 0.60
+    valuation_growth_search_step: float = 0.005
+    valuation_growth_tolerance: float = 1e-7
+    # WHY 1e-6 relative: EV that varies by less than a millionth across
+    # the whole growth range is flat (value-neutral growth). Float noise is
+    # around 1e-13, so this can't be triggered by rounding alone.
+    valuation_flat_tolerance: float = 1e-6
+    # WHY 1.5% over the risk-free rate: used ONLY when interest expense or
+    # debt is missing, so R_d can't be computed. It's roughly an
+    # investment-grade spread, and every use is flagged as an assumption.
+    valuation_default_credit_spread: float = 0.015
+    # WHY 0.25: used ONLY when revenue didn't grow over the lookback, which
+    # makes the historical incremental investment rate undefined. It's a
+    # placeholder for moderate reinvestment, not an estimate. Any valuation
+    # using it is flagged, and its implied growth should be read as
+    # illustrative.
+    valuation_default_incremental_investment_rate: float = 0.25
+    # WHY 400 days: a balance-sheet or share-count fact older than about a
+    # year plus a filing lag is stale. Ford's newest `dei` share count is
+    # from 2011, and this limit is what refuses to use it.
+    valuation_max_fact_age_days: int = 400
+    # WHY 10 days: enough calendar days to find the last trading day on or
+    # before as_of across a long weekend or holiday.
+    valuation_price_lookback_days: int = 10
+    # Sensitivity grid axes: growths as absolute rates, WACC as offsets
+    # from the computed WACC.
+    valuation_grid_growths: list[float] = [0.0, 0.05, 0.10, 0.15, 0.20]
+    valuation_grid_wacc_offsets: list[float] = [-0.02, -0.01, 0.0, 0.01, 0.02]
+
+    # Valuation Agent (Phase 6, Increment 6c)
+    valuation_agent_model: str | None = None
+    # WHY 2048: it interprets about 15 headline rows into a handful of
+    # claims, a smaller output than the 4096 the fact-heavy agents need.
+    valuation_agent_max_tokens: int = 2048
+
     @property
     def postgres_dsn(self) -> str:
         """Single source of truth for the plain (sync-style) connection

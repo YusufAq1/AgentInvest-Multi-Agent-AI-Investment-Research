@@ -18,7 +18,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from datetime import UTC, date, datetime
-from json import dumps as json_dumps
+from typing import Any
 from uuid import uuid4
 
 from backend.agents.prompt_loader import load_prompt
@@ -27,6 +27,7 @@ from backend.agents.xbrl_facts import (
     CONCEPT_ALIASES,
     FactKey,
     fact_key,
+    make_xbrl_fact_evidence,
     select_anchor,
     select_matching,
     select_prior_year,
@@ -35,7 +36,7 @@ from backend.calc.ratios import RATIO_FUNCS, RatioInputError
 from backend.core.config import Settings
 from backend.core.llm import ClaudeClient, StructuredOutputError
 from backend.data.models import DataUnavailable, XBRLFact
-from backend.data.xbrl import XBRLClient, find_raw_entry
+from backend.data.xbrl import XBRLClient
 from backend.evidence.models import Claim, ClaimBatch, Evidence
 from backend.evidence.store import EvidenceStore
 
@@ -112,27 +113,8 @@ class FinancialAgent:
 
         return await self._emit_claims(ticker)
 
-    def _make_fact_evidence(self, fact: XBRLFact, raw: dict[str, object]) -> Evidence:
-        entry = find_raw_entry(raw, fact)
-        return Evidence(
-            id=uuid4(),
-            run_id=self._store.run_id,
-            source_type="xbrl_fact",
-            source_ref=fact.accession_number,
-            published_at=fact.filed,
-            retrieved_at=datetime.now(UTC),
-            quote=json_dumps(entry, sort_keys=True, separators=(",", ":")),
-            location={
-                "concept": fact.concept,
-                "taxonomy": fact.taxonomy,
-                "unit": fact.unit,
-                "value": fact.value,
-                "accession_number": fact.accession_number,
-                "period_end": fact.period_end.isoformat(),
-                "fiscal_year": fact.fiscal_year,
-                "fiscal_period": fact.fiscal_period,
-            },
-        )
+    def _make_fact_evidence(self, fact: XBRLFact, raw: dict[str, Any]) -> Evidence:
+        return make_xbrl_fact_evidence(fact, raw, self._store.run_id, evidence_id=uuid4())
 
     def _build_ratio_evidence(
         self,

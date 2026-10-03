@@ -18,10 +18,14 @@ has that input simply skipped, not fabricated (C6).
 
 from __future__ import annotations
 
-from datetime import timedelta
-from typing import Final
+from datetime import UTC, datetime, timedelta
+from json import dumps as json_dumps
+from typing import Any, Final
+from uuid import UUID, uuid4
 
 from backend.data.models import XBRLFact
+from backend.data.xbrl import find_raw_entry
+from backend.evidence.models import Evidence
 
 CONCEPT_ALIASES: Final[dict[str, tuple[str, ...]]] = {
     "revenue": (
@@ -103,3 +107,34 @@ def select_prior_year(facts: list[XBRLFact], anchor: XBRLFact) -> XBRLFact | Non
     if abs((best.period_end - target).days) > PRIOR_YEAR_TOLERANCE_DAYS:
         return None
     return best
+
+
+def make_xbrl_fact_evidence(
+    fact: XBRLFact, raw: dict[str, Any], run_id: UUID, *, evidence_id: UUID | None = None
+) -> Evidence:
+    """An `xbrl_fact` Evidence row for one fact, quoting its exact raw
+    companyfacts entry (the string backend/evidence/validation.py checks
+    for containment in the raw payload). Shared by the Financial and
+    Valuation agents so both build byte-identical rows; originally private
+    to the Financial Agent. `evidence_id` lets a caller supply the id (the
+    Financial Agent's tests pin ids by patching its own `uuid4`)."""
+    entry = find_raw_entry(raw, fact)
+    return Evidence(
+        id=evidence_id or uuid4(),
+        run_id=run_id,
+        source_type="xbrl_fact",
+        source_ref=fact.accession_number,
+        published_at=fact.filed,
+        retrieved_at=datetime.now(UTC),
+        quote=json_dumps(entry, sort_keys=True, separators=(",", ":")),
+        location={
+            "concept": fact.concept,
+            "taxonomy": fact.taxonomy,
+            "unit": fact.unit,
+            "value": fact.value,
+            "accession_number": fact.accession_number,
+            "period_end": fact.period_end.isoformat(),
+            "fiscal_year": fact.fiscal_year,
+            "fiscal_period": fact.fiscal_period,
+        },
+    )

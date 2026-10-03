@@ -40,7 +40,7 @@ from backend.agents.base import ResearchAgent
 from backend.core.config import Settings
 from backend.core.llm import ClaudeClient, LLMCallResult
 from backend.evidence.store import EvidenceStore
-from backend.orchestration.planning import deterministic_plan
+from backend.orchestration.planning import Planner
 from backend.orchestration.state import (
     ALL_AGENTS,
     AgentName,
@@ -72,6 +72,10 @@ class AgentContext:
 
 AgentFactory = Callable[[AgentContext], ResearchAgent]
 ClaudeFactory = Callable[[Callable[[LLMCallResult], None]], ClaudeClient]
+# Builds the run's planner around a cost-tracked ClaudeClient. The real one
+# builds the Research Manager; tests use DeterministicPlanner, which ignores
+# the client.
+PlannerFactory = Callable[[ClaudeClient], Planner]
 
 
 @dataclass(frozen=True)
@@ -87,12 +91,17 @@ class RunDependencies:
     settings: Settings
     agent_factories: Mapping[AgentName, AgentFactory]
     claude_factory: ClaudeFactory
-    peer_map: Mapping[str, tuple[str, ...]]
+    planner_factory: PlannerFactory
 
 
-def _plan_node(deps: RunDependencies) -> Callable[..., dict[str, Any]]:
-    def plan(state: ResearchState) -> dict[str, Any]:
-        research_plan = deterministic_plan(state["ticker"], deps.peer_map)
+def _plan_node(deps: RunDependencies) -> Callable[..., Any]:
+    async def plan(state: ResearchState) -> dict[str, Any]:
+        # WHY the planner's cost is tracked like an agent's: the Research
+        # Manager is a paid Claude call, and "what did this run cost?" must
+        # include it (CLAUDE.md §5).
+        calls: list[LLMCallResult] = []
+        planner = deps.planner_factory(deps.claude_factory(calls.append))
+        research_plan = await planner.plan(state["ticker"], state["as_of"])
         skipped = [
             AgentOutcome(agent=s.agent, status="skipped", detail=s.reason)
             for s in research_plan.skipped
@@ -103,9 +112,10 @@ def _plan_node(deps: RunDependencies) -> Callable[..., dict[str, Any]]:
                 "source": research_plan.source,
                 "routed": research_plan.routed_agents(),
                 "skipped": [s.agent for s in research_plan.skipped],
+                "fallback_reason": research_plan.fallback_reason,
             }
         )
-        return {"plan": research_plan, "agent_outcomes": skipped}
+        return {"plan": research_plan, "agent_outcomes": skipped, "llm_calls": calls}
 
     return plan
 

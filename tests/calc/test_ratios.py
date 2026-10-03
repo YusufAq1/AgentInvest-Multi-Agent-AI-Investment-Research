@@ -8,6 +8,7 @@ from backend.calc.ratios import (
     current_ratio,
     gross_margin,
     net_margin,
+    revenue_cagr,
     yoy_revenue_growth,
 )
 
@@ -59,3 +60,23 @@ def test_ratio_funcs_dispatch_table_round_trips() -> None:
     result = gross_margin(revenue=1_000_000, cogs=600_000)
     recomputed = RATIO_FUNCS[result.name](**result.inputs)
     assert recomputed.value == pytest.approx(result.value)
+
+
+def test_revenue_cagr_by_hand() -> None:
+    """100 → 121 over 2 years: (121/100)^(1/2) − 1 = 1.1 − 1 = 0.10"""
+    result = revenue_cagr(revenue_start=100, revenue_end=121, years=2)
+    assert result.value == pytest.approx(0.10)
+    assert RATIO_FUNCS["revenue_cagr"] is revenue_cagr
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"revenue_start": 0, "revenue_end": 121, "years": 2},
+        {"revenue_start": 100, "revenue_end": -5, "years": 2},
+        {"revenue_start": 100, "revenue_end": 121, "years": 0},
+    ],
+)
+def test_revenue_cagr_rejects_invalid_inputs(kwargs: dict[str, float]) -> None:
+    with pytest.raises(RatioInputError):
+        revenue_cagr(**kwargs)

@@ -23,7 +23,7 @@ LLM call:
    rates, DCF, confidence scores — is a pure, unit-tested Python function.
    The LLM interprets results; it never computes them.
 
-## Current status: Phase 5 (Increment 5a) — LangGraph orchestration
+## Current status: Phase 6 complete — reverse-DCF valuation and the Valuation Agent
 
 ### Phase 0 — Foundation
 - `backend/core/config.py` — process settings (Anthropic key, default
@@ -393,7 +393,198 @@ START -> plan -> (fan-out) financial | filings | news | competitive -> collect -
 - The SEC combined-rate gap (`backend/data/http.py`) is now reachable
   under real concurrency.
 
-Not yet implemented: the LLM Research Manager (Increment 5b), valuation,
-the debate layer, the API, or the frontend. This file will grow with each phase — see `CLAUDE.md` §15
+**Increment 5b: the LLM Research Manager** (ADR-0020). The `plan` node
+now asks a `Planner` (`planning.py`) for the plan, built through
+`RunDependencies.planner_factory`.
+- **`backend/agents/manager.py` (`ResearchManager`)**: real runs use it.
+  - Haiku routes or skips every agent with a reason and
+    writes 3–8 Filings questions.
+  - The rules are checked in code via `extra_validation`: every agent
+    decided exactly once, at least one routed, Competitive only with
+    curated peers, bounded questions. A violation gets one retry with
+    feedback.
+  - Any Claude or SEC failure falls back to `deterministic_plan(...,
+    fallback_reason=...)`, marked `source="fallback"`, streamed in
+    `plan_ready`, and printed by the CLI.
+  - The planner's Claude cost lands in `llm_calls` like any agent's.
+- **`DeterministicPlanner`**: tests use it, and it's the fallback.
+- **Inputs (C7):** only ticker, as_of, curated peers, and
+  `backend/data/company.py`'s `CompanyProfile`. That's SEC's name,
+  resolved as of `as_of` via `formerNames`, and its SIC description
+  (today's value; SIC has no history). They're wrapped in
+  `<company_profile>` delimiters. Planning runs before any retrieval, so
+  retrieved text can't reach it.
+- **Supporting changes:**
+  - `backend/data/submissions.py` (the cached `submissions` fetch, now
+    shared by News and Company)
+  - a contract test binding every mocked SDK call against the real
+    `Messages.create` signature (`tests/conftest.py`), added after an
+    unsupported `temperature` argument passed the mocks and crashed the
+    first live run
+  - `DataUnavailable.source` gains `"sec_submissions"`
+
+**Tests:**
+- `tests/agents/test_manager.py` covers a valid plan, an SDK-valid
+  request with delimited company data, a peer-map violation retried with feedback, fallback after
+  two invalid plans, too few questions, an empty plan, a refusal, an
+  unavailable profile, an SEC outage, and an injected string staying
+  inside the delimiters.
+- `tests/data/test_company.py` covers as-of name resolution and range
+  boundaries.
+- `test_graph.py` adds the Manager skipping an agent (cost counted, agent
+  never built) and a fallback streamed while the run still completes.
+
+### Phase 6 — Valuation (`backend/calc/`)
+
+**Increment 6a: the pure calculation layer** (ADR-0006). No I/O, no LLM,
+mypy --strict, and every expected value in the tests is worked by hand.
+- **`wacc.py`**: `cost_of_equity` (CAPM), `after_tax_cost_of_debt`, `wacc`.
+- **`beta.py`**: `monthly_returns` (last close per calendar month; a
+  missing month never becomes a two-month return) and `ols_beta`
+  (`cov/var`, with a minimum number of overlapping months).
+- **`dcf.py`**: the Mauboussin value-driver reverse DCF.
+  - `ValueDrivers` holds base revenue, operating margin, tax, incremental
+    investment rate (IIR), horizon and WACC.
+  - `enterprise_value(drivers, g)` keeps the per-year breakdown, and uses
+    a perpetuity terminal value `NOPAT_N / WACC`.
+  - `solve_implied_growth` scans the growth range, then bisects. It
+    returns `ImpliedGrowth(growth, growth_creates_value, ...)` or
+    `NoImpliedGrowth(reason, ...)`: target above or below the range, or
+    value-neutral. It raises if it ever finds more than one crossing.
+  - `sensitivity_grid` gives value per share over growth × WACC.
+  - Also: `value_neutral_investment_rate` (the break-even IIR*),
+    `target_enterprise_value`, `incremental_investment_rate`.
+- **`ratios.py`** gained `revenue_cagr`, the history implied growth is
+  compared with.
+- **`errors.py`**: `ValuationInputError`, a subclass of
+  `RatioInputError`. Every scalar result is a `RatioResult`, so 6c can
+  make each one recomputable `computed` evidence.
+
+**Finding that changed the design:** for constant drivers, EV is
+monotonic in growth. It rises when IIR < IIR* = margin·(1 − tax)·(1 +
+WACC)/WACC, falls when IIR > IIR* (so a higher price implies *lower*
+growth), and is flat at IIR*. The planned "multiple roots / ambiguous"
+output was replaced by a direction flag, a value-neutral result, and a
+hard error on more than one crossing. ADR-0006 has the details, and a
+48-case property test pins the behaviour.
+
+**Increment 6b: inputs from free data and the exit criterion.**
+- **`backend/agents/valuation_inputs.py`**:
+  `ValuationInputAssembler.assemble(ticker, as_of)` returns
+  `ValuationInputs | ValuationUnavailable`.
+  - Each input is a `SourcedInput`: value, source (`xbrl`, `market`,
+    `fred`, `config`, `computed` or `assumed`), the exact XBRL facts it
+    came from, its `RatioResult` if computed, and a note.
+  - `ValuationUnavailable` lists *every* missing input at once. Ford, for
+    example, has no debt tags and a 2011 share count, so both are listed.
+  - Pure selection helpers:
+    - `annual_series`: one value per fiscal year from 10-Ks; alias
+      priority wins, then the latest filing
+    - `latest_instant`: refuses facts older than
+      `valuation_max_fact_age_days`
+    - `instant_on`, `prior_fiscal_year_ends`, `operating_working_capital`
+  - Its own `VALUATION_CONCEPTS` alias table was verified against real
+    companyfacts for AAPL, MSFT, NVDA, F, KO and AMZN. It doesn't extend
+    `CONCEPT_ALIASES`, to avoid changing the Financial Agent's inputs.
+  - Facts are re-filtered to `filed <= as_of` locally.
+  - Labelled fallbacks, never silent:
+    - cost of debt = R_f + spread when interest or debt is missing
+    - the investment rate uses a configured placeholder when revenue
+      didn't grow
+- **`backend/agents/valuation_compute.py`**: `compute_valuation` is pure.
+  It goes CAPM → WACC → target EV → implied growth → sensitivity grid,
+  plus 3- and 5-year revenue CAGRs.
+- **`backend/calc/` additions:** `implied_cost_of_debt`,
+  `average_operating_margin`, `market_capitalisation`, `net_debt`.
+- **`backend/data/prices.py`** (ADR-0021):
+  - `adjustment="as_traded"` rebuilds the price that actually traded.
+    yfinance's default adjustment encodes splits and dividends after
+    as_of, so NVDA 2024-05-31 came back as 109.32 instead of the real
+    $1,096.33.
+  - `get_splits(ticker, as_of)` returns splits up to as_of.
+  - The share count is restated to the price date's share basis.
+  - Also fixed: yfinance's `end` is exclusive, so the as_of day's own bar
+    was being dropped.
+- **`backend/data/macro.py` bug fix (from Phase 1):** sending
+  `realtime_end` without `realtime_start` made FRED default the start to
+  1776. Every *daily* series (DGS10, the risk-free rate) then failed with
+  HTTP 400: 4,562 vintages against FRED's limit of 2,000. Both ends are now
+  pinned to as_of, which is exactly "the vintage known on as_of".
+- **`scripts/valuation_demo.py`** prints every input with its XBRL
+  accession and filing date, the cost of capital, the implied growth with
+  a direction flag and an EV check, historical CAGRs, the sensitivity
+  grid, and the assumptions. It makes no Claude calls.
+- **Exit criterion met:**
+  - AAPL as of 2024-06-30 implies **18.56%** revenue growth a year for 10
+    years, at WACC 10.32%, against a 3-year CAGR of 11.8% and a 5-year
+    CAGR of 7.6%.
+  - `docs/valuation_worked_example.md` recomputes it independently by
+    hand: 18.555%.
+  - The NVDA split check gives $2.70T before the split and $3.04T after,
+    both matching reality.
+
+**Tests:**
+- `tests/agents/test_valuation_inputs.py` uses a synthetic company with
+  every input hand-checkable. It covers each value, a leaked post-as_of
+  restatement being ignored, all missing inputs reported together, both
+  assumed-value paths, share restatement across a split, the selection
+  helpers, and `compute_valuation` by hand.
+- `tests/data/test_prices.py` adds split un-adjustment, the
+  strictly-after rule, `get_splits` filtering, and `end = as_of + 1`.
+
+**Increment 6c: the Valuation Agent in the graph** (ADR-0022). The graph
+now has five specialist agents. `valuation` is routed by the
+deterministic plan, described to the Research Manager, and built in
+`runner.py` with a `ValuationInputAssembler`. `MacroClient` is closed with
+the run.
+- **`backend/agents/valuation.py`**: assemble → `compute_valuation` →
+  `build_valuation_evidence` → one Haiku call (`valuation_agent_v1.md`).
+  Claude sees only about 15 labelled headline rows (implied growth with
+  its value-creation direction, CAGRs, WACC and its parts, margin,
+  investment rate, break-even rate). It may compare them in words but
+  never compute a number. Missing inputs raise `ValuationUnavailableError`
+  listing every reason, so the bulkhead records a *failed* outcome rather
+  than a silent empty one.
+- **`backend/agents/valuation_evidence.py`**: about 47 rows per run (AAPL:
+  32 `xbrl_fact`, 2 `price_series`, 1 `macro`, 12 `computed`). Every
+  computed row cites its inputs by id, or by signed `[coefficient, id]`
+  combinations: the 3-year capex sum, `+FY0 − FY3` revenue change, shares
+  × split factor, working capital. It holds only the configured constants
+  the registry allows.
+- **`backend/calc/registry.py`**: `COMPUTED_FUNCS`, the one place that
+  says how each computed name is recomputed. It covers which function,
+  which source types its inputs may cite (ratios: XBRL only, unchanged;
+  valuation: also `price_series`, `macro`, `computed`), and which inputs
+  may be stored constants (ERP, tax, horizon, solver settings).
+- **`backend/evidence/validation.py`**:
+  - `_validate_computed` resolves linear combinations and enforces the
+    registry's input types and allowed constants.
+  - New `_validate_market_datum`: the quote must equal the canonical
+    rendering (`backend/evidence/market_quotes.py`), beta must equal
+    covariance/variance, and the decimal rate must equal percent/100.
+- **`backend/agents/xbrl_facts.make_xbrl_fact_evidence`**: extracted from
+  the Financial Agent so both agents build byte-identical XBRL rows.
+  Financial's tests are unchanged.
+- **Verified on real data:** AAPL's and NVDA's full evidence sets (47 rows
+  each) pass the CI citation sweep with zero failures. Every computed
+  number recomputes from source, implied growth included (AAPL 18.5551%),
+  and no row is dated after as_of.
+
+**Tests:**
+- `tests/agents/test_valuation.py` covers the full evidence sweep passing,
+  no row after as_of, a tampered margin failing both its own recompute and
+  the implied growth's, a tampered price failing its quote and the market
+  cap, assumed inputs as recomputable labelled rows, the agent storing a
+  cited claim with an SDK-valid request, and unavailable inputs raising
+  with every reason.
+- `tests/evidence/test_validation.py` adds linear combinations,
+  undeclared constants rejected, valuation chaining allowed (ratios
+  still XBRL-only), and the market-datum checks.
+
+**Phase 6 exit criterion met** (6b): implied growth computed for a real
+ticker and hand-verified (`docs/valuation_worked_example.md`).
+
+Not yet implemented: the debate layer (Bull / Bear / Critic / Judge,
+Phase 7), the API, or the frontend. This file will grow with each phase — see `CLAUDE.md` §15
 for the phase plan and §11 for the documentation standard this file
 follows.

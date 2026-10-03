@@ -45,6 +45,8 @@ def _print_event(event: dict[str, Any], started: float) -> None:
     kind = event["event"]
     if kind == "plan_ready":
         print(f"{elapsed} plan ({event['source']}): run {event['routed']}, skip {event['skipped']}")
+        if event.get("fallback_reason"):
+            print(f"{elapsed}   fallback because: {event['fallback_reason']}")
     elif kind == "agent_started":
         print(f"{elapsed} {event['agent']:<12} started")
     elif kind == "agent_finished":
@@ -58,6 +60,15 @@ def _print_event(event: dict[str, Any], started: float) -> None:
 
 
 def _print_summary(result: RunResult) -> None:
+    if result.plan is not None:
+        print(f"\n=== Plan ({result.plan.source}) ===")
+        for route in result.plan.routes:
+            print(f"  run  {route.agent:<12} {route.rationale}")
+        for skip in result.plan.skipped:
+            print(f"  skip {skip.agent:<12} {skip.reason}")
+        for question in result.plan.filings_questions:
+            print(f"  filings question: {question}")
+
     print("\n=== Outcomes ===")
     for outcome in sorted(result.outcomes, key=lambda o: o.agent):
         print(

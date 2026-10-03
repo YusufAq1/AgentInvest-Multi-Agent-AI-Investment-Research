@@ -22,7 +22,7 @@ class DataUnavailable(BaseModel):
     and why some other failures are deliberately NOT converted to this.
     """
 
-    source: Literal["edgar", "xbrl", "yfinance", "fred", "sec_8k", "cik_lookup"]
+    source: Literal["edgar", "xbrl", "yfinance", "fred", "sec_8k", "sec_submissions", "cik_lookup"]
     identifier: str
     as_of: date
     reason: str
@@ -89,12 +89,38 @@ class PriceBar(BaseModel):
     volume: int
 
 
+class StockSplit(BaseModel):
+    """One stock split: on `date`, each share became `ratio` shares
+    (NVDA's 10-for-1 on 2024-06-10 is ratio=10.0). The split takes effect
+    at the open, so that day's bar already trades at the post-split price."""
+
+    date: date
+    ratio: float
+
+
 class MacroObservation(BaseModel):
     """One FRED data point for a given series."""
 
     series_id: str
     date: date
     value: float
+
+
+class CompanyProfile(BaseModel):
+    """Who a ticker is, as of a date: the Research Manager's only
+    company-specific input (CLAUDE.md C7; see backend/agents/manager.py).
+
+    `name` is resolved as of `as_of` from SEC's `formerNames` history, so a
+    2006 run sees "APPLE COMPUTER INC", not today's name. `sic_description`
+    has NO history in SEC's API; it is today's classification, treated as
+    time-invariant. That's a documented limitation, not a point-in-time fact.
+    """
+
+    ticker: str
+    cik: str
+    name: str
+    sic: str | None
+    sic_description: str | None
 
 
 class EightKEvent(BaseModel):

@@ -6,12 +6,16 @@ subjects them to adversarial critique, and produces an auditable,
 evidence-linked research report — one where every material claim traces to
 a primary source and states what would prove it wrong.
 
-**Status: Phase 2 — Evidence Store + Financial Agent.** The first agent is
-live: given a `(ticker, as_of)`, the Financial Agent reads XBRL, computes
-ratios in pure Python, and asks Claude which resulting facts are
-claim-worthy — every claim citing evidence Python built and verified, never
-free text Claude invented. See `docs/ARCHITECTURE.md` for what's
-implemented so far and `docs/adr/` for the reasoning behind key decisions.
+**Status: Phase 6 complete.** Given a `(ticker, as_of)`, one command plans
+the research (an LLM Research Manager with code-enforced guardrails) and
+runs five specialist agents in parallel as a LangGraph graph: Financial
+(XBRL ratios), Filings (hybrid RAG over the 10-K), News (8-K materiality),
+Competitive (curated peers) and Valuation (a reverse DCF: the revenue
+growth the market price implies, against the company's own history). Every
+claim cites evidence Python built, and every computed number, valuation
+included, recomputes from its cited source rows in CI. Next is Phase 7, the
+Bull / Bear / Critic / Judge debate layer. See `docs/ARCHITECTURE.md` for
+what's implemented and `docs/adr/` for why.
 
 ## Setup
 
@@ -22,6 +26,9 @@ docker compose up -d
 uv run python scripts/hello_world.py           # Phase 0: proves Claude cost tracking works
 uv run python scripts/data_layer_demo.py       # Phase 1: proves the data layer works
 uv run python scripts/financial_agent_demo.py  # Phase 2: proves the Financial Agent works
+uv run alembic upgrade head                     # once, before the first research run
+uv run python scripts/valuation_demo.py --ticker AAPL --as-of 2024-06-30  # Phase 6: free, no Claude calls
+uv run python scripts/run_research.py --ticker AAPL --as-of 2024-06-30    # full research stage
 ```
 
 ## Development

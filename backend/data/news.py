@@ -17,8 +17,7 @@ from backend.data.cik import CikResolver
 from backend.data.errors import CikNotFoundError
 from backend.data.http import SecHttpClient
 from backend.data.models import DataUnavailable, EightKEvent
-
-_CACHE_SOURCE = "sec_submissions"
+from backend.data.submissions import fetch_submissions
 
 # Source of truth: the current SEC Form 8-K instructions
 # (https://www.sec.gov/files/form8-k.pdf). Deliberately includes Item 1.05
@@ -108,19 +107,7 @@ class NewsClient:
         return events
 
     async def _get_raw_submissions(self, cik: str) -> dict[str, Any]:
-        # Same fetch-day cache-key approach as xbrl.py — submissions has no
-        # upstream as_of parameter, so the real filter is applied in Python
-        # on every read, not assumed correct because it's in the cache.
-        fetch_day = datetime.now(UTC).date()
-        args = {"cik": cik}
-        cached = await self._cache.get(source=_CACHE_SOURCE, args=args, as_of=fetch_day)
-        if cached is not None:
-            return cached
-
-        url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-        raw = await self._http.get_json(url)
-        await self._cache.set(source=_CACHE_SOURCE, args=args, as_of=fetch_day, payload=raw)
-        return raw
+        return await fetch_submissions(self._http, self._cache, cik)
 
 
 def _oldest_filing_date(recent: dict[str, Any]) -> date | None:

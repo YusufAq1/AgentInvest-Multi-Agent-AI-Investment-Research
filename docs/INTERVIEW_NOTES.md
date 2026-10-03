@@ -365,3 +365,172 @@ that already finished aren't rerun or re-paid; only the interrupted ones
 run again. A test proves this by interrupting one of four parallel agents
 and asserting the other three were built exactly once across both
 attempts.
+
+## How does the manager decide which agents to run?
+
+Haiku decides. For every agent it either routes it with a
+rationale or skips it with a reason, and it writes 3–8 research questions
+for the Filings Agent tailored to the kind of business. But what it's
+allowed to say is enforced in code, not in the prompt.
+- Agent names are a closed `Literal`.
+- Every agent must be decided exactly once, and at least one must run.
+- Competitive can only be routed if the ticker has a curated peer group.
+- The question count is bounded.
+
+A violation gets one retry with the error fed back. A second failure, a
+refusal, an API outage, or SEC being down all fall back to a
+deterministic plan, which is marked `fallback` with the reason and printed.
+The planner can never be what kills a run. The trade-off I accepted is
+some non-determinism in routing. Temperature 0 minimises it, and the
+consistency eval will measure it (ADR-0020).
+
+## Can a prompt injection change the research plan?
+
+Not through retrieved content, because planning runs before any retrieval.
+The Manager sees only the ticker, the date, our curated peer list, and SEC's
+own name and industry code, wrapped in delimiters the prompt declares to
+be data. Even if that metadata carried an instruction, the output still
+has to pass the code-level rules above, so the worst an injection could do
+is produce a *valid* plan, which is equally a plan the model might choose
+anyway. There's a test that plants an instruction in the company name and
+checks it stays inside the delimiters and the plan still validates.
+
+## Your tests passed but the first live run crashed. What happened?
+
+The Research Manager passed `temperature=0` to make routing more
+repeatable. The installed Anthropic SDK has no sampling parameters on
+`messages.create` at all, so the real call failed with a `TypeError`. Every
+test passed because they mocked the SDK with a bare `MagicMock`, which
+accepts any keyword. I had tested my code against my assumption about the
+SDK, not against the SDK.
+
+Two fixes. I removed the parameter; I didn't force it through `extra_body`,
+because that would quietly send something this SDK version doesn't model.
+And I added a contract test: every mocked `messages.create` call is bound
+against the real installed signature with `inspect.signature(...).bind`, so
+an unknown keyword now fails in CI instead of in a live run.
+
+The crash was also the correct behaviour. The Manager falls back to the
+deterministic plan on *expected* failures: bad output, a refusal, an API
+outage, SEC being down. A `TypeError` is a bug in my code. Falling back on
+it would have hidden the bug behind a plausible-looking run, so it's right
+that it stopped the run before any agent spent anything.
+
+## Why a reverse DCF instead of a normal DCF?
+
+A normal DCF asks me to guess the growth rate, the margins and the
+discount rate, then prints a "fair value" to two decimals. That number is
+just my guesses with a dollar sign on them. A reverse DCF takes the market
+price as given and solves for the growth the price implies. "The market is
+pricing in 9% a year for ten years" is a claim I can actually test against
+the company's own history, and testing claims is what the rest of the
+system is built for. That's Rappaport and Mauboussin's *Expectations
+Investing*. I still show a growth × WACC sensitivity grid, so the reader
+sees how much the answer moves with the discount rate instead of trusting
+one number.
+
+## Doesn't higher growth always mean a higher valuation?
+
+No, and building the solver taught me that. In my model, growth has to be
+paid for: every extra dollar of revenue needs some investment. Growth only
+adds value if the return on that investment beats the cost of capital.
+The break-even investment rate works out to margin × (1 − tax) × (1 +
+WACC) / WACC.
+- **Below break-even**, enterprise value rises with growth.
+- **Above it**, value *falls* as growth rises, so a higher stock price
+  actually implies lower growth.
+- **Exactly at it**, growth doesn't change value at all, and the price
+  tells you nothing about growth.
+
+I first assumed the curve could rise and then fall and designed for
+multiple answers. When I tested it, it's always monotonic for constant
+inputs, so I replaced that with a direction flag, an explicit "growth not
+identifiable" result, and a hard error if the solver ever finds two
+answers. A property test across 48 combinations pins it down.
+
+## How do you stop the LLM getting the maths wrong?
+
+The LLM never sees the maths. Cost of equity, WACC, beta, the DCF, the
+solver, CAGR and the sensitivity grid are all pure Python functions in
+`backend/calc/`, with tests whose expected values I worked out by hand in
+the test docstrings. One test walks a two-year DCF line by line: revenue,
+NOPAT, investment, free cash flow, discounting, terminal value. Another
+prices the model at a known growth rate and checks the solver returns
+exactly that rate. Every result carries its formula and inputs, so when it
+becomes evidence the citation check can recompute it from scratch. Claude
+only interprets the numbers; it can't change them.
+
+## Where else did look-ahead bias hide, beyond filings?
+
+In the stock price. yfinance's history is adjusted for every split and
+dividend up to today. So NVDA's close on 2024-05-31 comes back as about
+$109, when it actually traded at $1,096; the 10-for-1 split happened ten
+days *later*. Multiply that by the share count from Nvidia's own filing and
+the market cap is ten times too small. The series knows about a corporate
+action that hadn't happened yet.
+
+I fixed it by fetching dividend-unadjusted prices and multiplying back by
+the splits after each date. That recovers the price that actually printed.
+Using later splits to *undo* the vendor's adjustment isn't look-ahead,
+because it only recovers a number that was public that day.
+
+There was a second, subtler problem. The share count is reported weeks
+before the price date, so across a split it's on the wrong basis even with
+correct prices. So the count is restated for splits between its date and
+the price date, both of which are before as_of. The adjusted series is
+still right for beta, because returns should include dividends. I verified
+both NVDA market caps against reality: $2.70T before the split, $3.04T
+after.
+
+## How did you verify the valuation is right?
+
+Three ways.
+- Every formula has unit tests with hand-worked expected values.
+- I re-derived a real run by hand. `docs/valuation_worked_example.md` takes
+  AAPL as of mid-2024 and redoes every step from the printed inputs, with
+  plain arithmetic that doesn't import my code: margins, working capital,
+  the investment rate, WACC, and the ten-year cash-flow table. It lands on
+  18.555% implied growth, against the module's 18.56%.
+- I checked against known facts: AAPL's 2024-06-28 close of $210.62, and
+  NVDA's market cap on both sides of its split.
+
+Building it also surfaced a Phase 1 bug. My FRED client had never actually
+worked for daily series. It sent only `realtime_end`, so FRED assumed a
+start date in 1776 and rejected the request for having too many vintages.
+The tests mocked FRED, so they never saw it. The fix pins both ends to
+as_of, which is exactly the point-in-time question anyway.
+
+## How do you stop the LLM from misquoting a valuation number?
+
+Claude never produces one. Python computes the whole chain: margin,
+reinvestment, market cap, net debt, beta, cost of equity, WACC, then the
+implied growth. Every number is stored as evidence that cites the rows it
+came from. Some inputs are sums or differences of rows, like three years of
+capex or revenue now minus revenue three years ago, so citations can be
+signed combinations of rows. CI then recomputes every number from what it
+cites and fails on any mismatch. That includes re-running the growth solver.
+
+Claude sees about 15 headline rows and may only compare them in words. It
+can't do arithmetic or make up a number. It cites a row's id, and the
+validator rejects any id that doesn't exist. If someone edits the stored
+margin, two checks fail: the margin's own recompute, and the implied
+growth's, because that row recomputes from the margin row.
+
+## What does "the market implies 18.6% growth" actually mean, and when is there no answer?
+
+It means: hold this company's margin, reinvestment and cost of capital
+fixed, and the current share price only makes sense if revenue grows about
+18.6% a year for ten years. It's a statement about the market's
+expectations, not a price target. Comparing it with the company's own
+history (11.8% over three years for Apple in mid-2024) is where the
+research starts.
+
+There are three ways to get no clean answer:
+- **The price is outside what any growth in the search range can
+  produce.** The system says so and names the bound, rather than clipping
+  to it.
+- **Reinvestment sits exactly at break-even.** Growth then adds no value,
+  so the price can't tell you anything about growth.
+- **Required data is missing.** Ford tags no debt in XBRL, for example.
+  The agent then fails visibly and lists every missing input, rather than
+  returning nothing quietly.
